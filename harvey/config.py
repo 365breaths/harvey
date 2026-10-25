@@ -31,6 +31,9 @@ class PersonaConfig(BaseModel):
     email: str
     linkedin: str
     tone: str
+    # Display name in the From header (e.g. "Daniel – Leadstosuccess").
+    # Empty = use `name`.
+    from_name: str = ""
 
 
 class OfferConfig(BaseModel):
@@ -86,6 +89,9 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
+    # Temporary (4xx) send failures are retried this many times in total,
+    # with growing gaps; permanent (5xx) ones never are.
+    max_send_attempts: int = 3
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -153,8 +159,29 @@ class PreclearedConfig(BaseModel):
         return self
 
 
+DEFAULT_OPT_OUT_LINE = (
+    "Not interested? Reply \"unsubscribe\" and I won't email you again."
+)
+
+
+class FooterConfig(BaseModel):
+    """CAN-SPAM / CASL footer appended to every outgoing email at send time.
+
+    Native providers refuse to send while `postal_address` is empty or
+    still a PUT_..._HERE placeholder — no footer, no email.
+    """
+
+    postal_address: str = ""
+    opt_out_line: str = DEFAULT_OPT_OUT_LINE
+    # Mailbox the List-Unsubscribe header points at. Empty = the sending
+    # mailbox, which is the one Harvey reads; set another only if Harvey
+    # reads that one too, or opt-outs sent there would be missed.
+    unsubscribe_email: str = ""
+
+
 class ComplianceConfig(BaseModel):
     precleared: PreclearedConfig = PreclearedConfig()
+    footer: FooterConfig = FooterConfig()
 
 
 class QuietHoursConfig(BaseModel):

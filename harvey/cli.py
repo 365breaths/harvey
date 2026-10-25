@@ -442,6 +442,12 @@ def cmd_outbox(args):
 
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
+        uncertain = await state.get_outbox(status="uncertain", limit=50)
+        if uncertain:
+            print(f"\n  ⚠ {len(uncertain)} email(s) were interrupted mid-send and "
+                  "MAY have gone out (Harvey won't resend them):")
+            for item in uncertain:
+                print(f"    [{item['id']}] → {item['to_email']}  {item['subject'][:50]}")
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
         print("  " + "=" * 60)
@@ -655,6 +661,38 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def cmd_suppress(args):
+    """The do-not-email list: list, add or remove addresses / @domains."""
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        target = (args.address or "").strip().lower()
+        if args.suppress_action in ("add", "remove") and not target:
+            print("\n  Give an address or @domain, e.g. harvey suppress add jane@acme.com\n")
+            return
+        if args.suppress_action == "add":
+            added = await state.add_suppression(target, args.reason or "manual", "cli")
+            if added:
+                # Stop anything already queued for that person right away.
+                prospect = await state.get_prospect_by_email(target)
+                if prospect:
+                    await state.cancel_pending_outbox_for_prospect(prospect.id, reason="suppressed")
+            print(f"\n  {'Suppressed' if added else 'Already suppressed'}: {target}\n")
+        elif args.suppress_action == "remove":
+            removed = await state.remove_suppression(target)
+            print(f"\n  {'Removed' if removed else 'Not on the list'}: {target}\n")
+        else:
+            rows = await state.list_suppressions()
+            print(f"\n  Do-not-email list — {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}")
+            for row in rows:
+                print(f"    {row['email']:<40} {row['reason'][:40]:<40} {str(row['created_at'])[:10]}")
+            print("")
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
@@ -787,6 +825,14 @@ def main():
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])
     sub.set_defaults(func=cmd_sending)
+
+    sub = subparsers.add_parser(
+        "suppress", help="Do-not-email list: list | add <email|@domain> | remove <email|@domain>")
+    sub.add_argument("suppress_action", nargs="?", default="list",
+                     choices=["list", "add", "remove"])
+    sub.add_argument("address", nargs="?", default="")
+    sub.add_argument("--reason", default="", help="Why (e.g. 'asked by phone')")
+    sub.set_defaults(func=cmd_suppress)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

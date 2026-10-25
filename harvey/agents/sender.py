@@ -5,9 +5,12 @@ Native flow:
   1. Draft campaigns are STAGED: merge variables rendered per prospect,
      one outbox row per (prospect, step) with a scheduled send_at.
      Rows start as pending_review (copilot) or approved (autopilot).
-  2. Each heartbeat DRAINS due approved rows: kill-switch check, stop-on-
-     reply check, deterministic pre-send gate, then provider.send_email
-     with jittered pacing and the daily cap.
+  2. Each heartbeat DRAINS due approved rows: kill-switch check (before
+     every email), suppression and stop-on-reply checks, deterministic
+     pre-send gate, then provider.send_email with jittered pacing and the
+     daily cap. The row is claimed ('sending') before the call, so a crash
+     mid-send can never lead to a second copy. Every call is logged in
+     send_attempts with the server's exact answer.
 """
 
 import asyncio
@@ -18,11 +21,27 @@ from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.footer import build_footer, with_footer
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mail_provider import (
+    ACCEPTED,
+    NATIVE_PROVIDERS,
+    PROVIDER_ERROR,
+    RECIPIENT_REJECTED,
+    SENDER_REJECTED,
+    TEMPORARY,
+    UNCERTAIN,
+    get_mail_provider,
+)
 from harvey.integrations.precleared import PreclearedClient
 from harvey.state import StateManager
+from harvey.suppression import (  # noqa: F401 (BOUNCE_COUNT_KEY re-exported)
+    BOUNCE_COUNT_KEY,
+    KILL_SWITCH_KEY,
+    pause_sending,
+    record_hard_bounce,
+)
 
 logger = logging.getLogger("harvey.sender")
 
@@ -31,11 +50,11 @@ logger = logging.getLogger("harvey.sender")
 MAX_SENDS_PER_CYCLE = 8
 SEND_JITTER_SECONDS = (4, 15)
 
+# Gap before each retry of a temporary (4xx) failure.
+RETRY_BACKOFF_MINUTES = (30, 120, 480)
+
 # Prospect pipeline statuses that mean "stop emailing this person".
 STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
-
-KILL_SWITCH_KEY = "sending_paused"
-BOUNCE_COUNT_KEY = "bounce_count"
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -190,6 +209,8 @@ class Sender:
                 logger.warning(f"Sender: Skipping invalid email '{prospect.email}'")
                 continue
             if email in seen_emails:
+                continue
+            if await self.state.get_suppression(email):
                 continue
             if prospect.status not in SENDABLE_STATUSES:
                 # Already contacted / replied / opted out — never double-send.
@@ -378,6 +399,8 @@ class Sender:
                 continue
             if prospect.status not in SENDABLE_STATUSES:
                 continue
+            if await self.state.get_suppression(email):
+                continue
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
@@ -429,6 +452,22 @@ class Sender:
             )
             return
 
+        footer = build_footer(self.config)
+        if footer is None:
+            logger.warning(
+                "Sender: no postal address in compliance.footer — outbox is "
+                "holding. CAN-SPAM/CASL require one in every email."
+            )
+            return
+
+        stuck = await self.state.mark_stuck_sending_uncertain()
+        if stuck:
+            logger.error(
+                f"Sender: {stuck} email(s) were interrupted mid-send and are "
+                "now 'uncertain' in the Outbox. They may or may not have gone "
+                "out; Harvey will not resend them."
+            )
+
         max_daily = self.config.channels.email.max_daily_sends
         sent_today = await self.state.count_outbox_sent_today()
         budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
@@ -460,12 +499,19 @@ class Sender:
             return
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        max_attempts = max(1, int(getattr(self.config.channels.email, "max_send_attempts", 3)))
         sent = 0
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
         for item in due:
             if sent >= budget:
+                break
+            # Before EVERY email, not once per cycle: a pause from the
+            # dashboard, the CLI or a bounce stops the very next send.
+            paused = await self.state.get_setting(KILL_SWITCH_KEY)
+            if paused:
+                logger.warning(f"Sender: SENDING PAUSED ({paused}). Stopping here.")
                 break
             needs_check = self.precleared is not None and item["kind"] == "sequence"
             if needs_check and compliance_paused:
@@ -478,6 +524,14 @@ class Sender:
                 )
                 continue
 
+            suppressed = await self.state.get_suppression(item["to_email"])
+            if suppressed:
+                await self.state.update_outbox_item(
+                    item["id"], status="cancelled",
+                    error=f"suppressed: {suppressed}"[:300],
+                )
+                continue
+
             # Stop-on-reply / opt-out: never continue a sequence after contact.
             if item["kind"] == "sequence" and prospect.status in STOP_STATUSES:
                 await self.state.update_outbox_item(
@@ -486,8 +540,9 @@ class Sender:
                 )
                 continue
 
+            body = with_footer(item["body"], footer)
             gate = pre_send_check(
-                item["to_email"], item["subject"], item["body"],
+                item["to_email"], item["subject"], body,
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
             )
             if not gate:
@@ -525,22 +580,41 @@ class Sender:
                     continue
                 receipt_id = clearance.receipt_id
 
+            # Claim the row (approved -> sending) and record the Message-ID
+            # first. If Harvey dies after the server took the email but
+            # before the result is saved, the row stays 'sending' and is
+            # never sent again (it becomes 'uncertain' next cycle).
+            preset_id = self.provider.make_message_id()
+            if not await self.state.claim_outbox_item(item["id"], preset_id):
+                continue
+            extra = {"message_id": preset_id} if preset_id else {}
             result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
+                item["to_email"], item["subject"], body,
                 thread_ref=item.get("thread_ref", ""),
                 in_reply_to=item.get("in_reply_to", ""),
+                **extra,
+            )
+            outcome = result.outcome or (ACCEPTED if result.ok else "failed")
+            await self.state.log_send_attempt(
+                outbox_id=item["id"], prospect_id=prospect.id,
+                to_email=item["to_email"], provider=self.provider.name,
+                outcome=outcome, smtp_code=result.smtp_code,
+                smtp_response=result.smtp_response,
+                message_id=result.message_id or preset_id, error=result.error,
             )
             if not result.ok:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed", error=result.error[:300]
-                )
+                if await self._handle_send_failure(item, prospect, result, max_attempts):
+                    break
                 continue
 
             sent += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso,
-                message_id=result.message_id, thread_ref=result.thread_ref,
+                message_id=result.message_id or preset_id,
+                thread_ref=result.thread_ref,
+                attempts=(item.get("attempts") or 0) + 1,
+                smtp_code=result.smtp_code, smtp_response=result.smtp_response[:500],
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
@@ -562,6 +636,9 @@ class Sender:
             details = {
                 "to": item["to_email"], "step": item["step"],
                 "kind": item["kind"], "provider": self.provider.name,
+                "message_id": result.message_id or preset_id,
+                "smtp_code": result.smtp_code,
+                "smtp_response": result.smtp_response[:200],
             }
             if receipt_id:
                 details["precleared_receipt"] = receipt_id
@@ -582,3 +659,75 @@ class Sender:
         if sent:
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{max_daily} today).")
+
+    async def _handle_send_failure(self, item, prospect, result, max_attempts: int) -> bool:
+        """Record a refused or failed send. Returns True when draining should
+        stop for this cycle (the server is pushing back, or sending paused)."""
+        attempts = (item.get("attempts") or 0) + 1
+        server = f"{result.smtp_code} {result.smtp_response}".strip()
+        fields = {
+            "attempts": attempts, "error": (result.error or server)[:300],
+            "smtp_code": result.smtp_code, "smtp_response": result.smtp_response[:500],
+        }
+        outcome = result.outcome
+
+        if outcome == RECIPIENT_REJECTED:
+            # The address itself is bad: never try it again, any step.
+            await self.state.update_outbox_item(item["id"], status="failed", **fields)
+            tripped = await record_hard_bounce(
+                self.state, self.config, prospect, [item["to_email"]],
+                reason=f"refused at send: {server}"[:200], source="sender",
+            )
+            logger.warning(
+                f"Sender: {item['to_email']} refused by the server ({server}). "
+                "Suppressed; its other queued emails are cancelled."
+            )
+            return bool(tripped)
+
+        if outcome == TEMPORARY:
+            if attempts >= max_attempts:
+                fields["error"] = f"gave up after {attempts} attempts: {fields['error']}"[:300]
+                await self.state.update_outbox_item(item["id"], status="failed", **fields)
+            else:
+                wait = RETRY_BACKOFF_MINUTES[min(attempts, len(RETRY_BACKOFF_MINUTES)) - 1]
+                retry_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=wait)
+                await self.state.update_outbox_item(
+                    item["id"], status="approved", send_at=retry_at.isoformat(), **fields
+                )
+                logger.warning(
+                    f"Sender: temporary failure to {item['to_email']} ({server}); "
+                    f"retry {attempts + 1}/{max_attempts} in {wait} min."
+                )
+            return True
+
+        if outcome == SENDER_REJECTED:
+            status = "failed" if attempts >= max_attempts else "approved"
+            await self.state.update_outbox_item(item["id"], status=status, **fields)
+            await pause_sending(
+                self.state,
+                f"the mail server refused to send ({server[:160]}) — check the "
+                "account, its sending limits and the email content before resuming",
+            )
+            return True
+
+        if outcome == PROVIDER_ERROR:
+            # Nothing reached the server (connection/login): not this email's
+            # fault, so it keeps its place and its attempt count.
+            fields["attempts"] = item.get("attempts") or 0
+            await self.state.update_outbox_item(item["id"], status="approved", **fields)
+            logger.error(f"Sender: mail server unavailable ({result.error}). Holding the outbox.")
+            return True
+
+        if outcome == UNCERTAIN:
+            await self.state.update_outbox_item(item["id"], status="uncertain", **fields)
+            if prospect.status in ("new", "queued"):
+                await self.state.update_prospect_status(prospect.id, "contacted")
+            logger.error(
+                f"Sender: connection lost while sending to {item['to_email']}; it "
+                "may or may not have gone out. Marked 'uncertain', not retried."
+            )
+            return True
+
+        # Providers that don't classify failures: recorded as failed, as before.
+        await self.state.update_outbox_item(item["id"], status="failed", **fields)
+        return False

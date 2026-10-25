@@ -24,6 +24,7 @@ from email.utils import parseaddr
 
 import httpx
 
+from harvey.footer import list_unsubscribe_header
 from harvey.paths import PROJECT_ROOT
 from harvey.integrations.mail_provider import (
     InboundMessage,
@@ -144,6 +145,9 @@ class GmailProvider(MailProvider):
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to
+        unsubscribe = list_unsubscribe_header(self.config)
+        if unsubscribe:
+            msg["List-Unsubscribe"] = unsubscribe
         msg.set_content(body)
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()

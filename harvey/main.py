@@ -407,6 +407,26 @@ async def _run_with_signals():
     await heartbeat(stop_event)
 
 
+def _log_to_file():
+    """Keep the run log on disk too (data/logs/harvey.log, rotated), so what
+    happened while nobody watched the terminal can be checked later."""
+    from logging.handlers import RotatingFileHandler
+    from harvey.paths import PROJECT_ROOT
+    try:
+        log_dir = PROJECT_ROOT / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_dir / "harvey.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning(f"Not writing a log file: {e}")
+        return
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S"
+    ))
+    logging.getLogger().addHandler(handler)
+
+
 def main():
     """Entry point."""
     # Check for first-time setup
@@ -416,6 +436,7 @@ def main():
         asyncio.run(run_setup())
         return
 
+    _log_to_file()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:

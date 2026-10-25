@@ -79,6 +79,8 @@ const STATUS = {
   failed:         ['Failed', 'bad'],
   rejected:       ['Rejected', 'idle'],
   cancelled:      ['Cancelled', 'idle'],
+  sending:        ['Sending', 'active'],
+  uncertain:      ['Check: may have sent', 'bad'],
   // signals
   proposed:       ['Waiting on you', 'waiting'],
   confirmed:      ['Confirmed', 'good'],

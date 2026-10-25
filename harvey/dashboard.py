@@ -708,7 +708,7 @@ async def get_outbox_api():
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
             "failed": (await query_db(
-                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
+                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled','uncertain') "
                 "ORDER BY updated_at DESC LIMIT 25")),
         }
     except Exception as e:

@@ -12,17 +12,24 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.footer import strip_quoted
 from harvey.integrations.instantly import InstantlyClient
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mail_provider import (
+    NATIVE_PROVIDERS,
+    get_mail_provider,
+    is_permanent_bounce,
+)
 from harvey.models.conversation import Conversation, Message
 from harvey.state import StateManager
+from harvey.suppression import (  # noqa: F401 (constants re-exported)
+    BOUNCE_COUNT_KEY,
+    KILL_SWITCH_KEY,
+    MIN_SENDS_FOR_KILL_SWITCH,
+    record_hard_bounce,
+    suppress,
+)
 
 logger = logging.getLogger("harvey.handler")
-
-KILL_SWITCH_KEY = "sending_paused"
-BOUNCE_COUNT_KEY = "bounce_count"
-# Kill switch only engages after this many sends (a tiny sample lies).
-MIN_SENDS_FOR_KILL_SWITCH = 10
 
 INTENT_LABELS = {
     "interested",
@@ -202,9 +209,32 @@ class Handler:
         reply_meta: dict | None = None,
     ):
         """Classify, record, and respond to a single reply."""
-        # Find the prospect by email (indexed lookup)
-        prospect = await self.state.get_prospect_by_email(lead_email)
+        reply_meta = reply_meta or {}
+        # The reply's own headers say which email it answers; that also
+        # catches replies sent from an alias or a forwarding address.
+        prospect = await self._prospect_from_headers(reply_meta)
+        if prospect is None:
+            prospect = await self.state.get_prospect_by_email(lead_email)
+
+        # Quoted text and our own footer would otherwise read as an opt-out.
+        # The subject counts too: a mail client's "Unsubscribe" button
+        # (List-Unsubscribe mailto) sends subject "unsubscribe".
+        subject_lower = (reply_meta.get("subject") or "").lower()
+        text_lower = strip_quoted(reply_text, self.config).lower()
+        opted_out = any(
+            p in text_lower or p in subject_lower for p in OPT_OUT_PATTERNS
+        )
+
         if not prospect:
+            if opted_out:
+                # Not someone we know, but the request still stands.
+                await suppress(self.state, [lead_email], "opted_out", "handler")
+                await self.state.log_action(
+                    action_type="opt_out", agent="handler",
+                    details={"prospect_email": lead_email, "matched": False},
+                )
+                logger.info(f"Handler: opt-out from unknown sender {lead_email}. Suppressed.")
+                return
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
 
@@ -223,8 +253,7 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        text_lower = reply_text.lower()
-        if any(p in text_lower for p in OPT_OUT_PATTERNS):
+        if opted_out:
             intent = "unsubscribe"
         elif any(p in text_lower for p in ESCALATION_PATTERNS):
             intent = "escalate"
@@ -281,6 +310,9 @@ class Handler:
             # Honor opt-outs ALWAYS. No reply, no future contact.
             await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
             await self.state.update_prospect_status(prospect.id, "opted_out")
+            await suppress(
+                self.state, [prospect.email, lead_email], "opted_out", "handler"
+            )
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
@@ -374,6 +406,9 @@ class Handler:
             )
             return True  # nothing to read; the sender can't send through it either
 
+        if hasattr(self.provider, "is_known"):
+            # Lets the provider skip downloading messages already handled.
+            self.provider.is_known = self.state.is_reply_processed
         try:
             inbound = await self.provider.get_replies()
         except Exception as e:
@@ -399,6 +434,8 @@ class Handler:
                             "thread_ref": msg.thread_ref,
                             "message_id": msg.message_id,
                             "subject": msg.subject,
+                            "in_reply_to": msg.in_reply_to,
+                            "references": msg.references,
                         },
                     )
                 handled += 1
@@ -420,51 +457,88 @@ class Handler:
             logger.info("Handler: no new replies.")
         return complete
 
+    @staticmethod
+    def _header_ids(*values: str) -> list[str]:
+        """Message-IDs from In-Reply-To / References style headers."""
+        ids: list[str] = []
+        for value in values:
+            for token in (value or "").replace(",", " ").split():
+                token = token.strip()
+                if token and token not in ids:
+                    ids.append(token)
+        return ids
+
+    async def _outbox_from_ids(self, ids: list[str]) -> dict | None:
+        for message_id in ids:
+            item = await self.state.find_outbox_by_message_id(message_id)
+            if item:
+                return item
+        return None
+
+    async def _prospect_from_headers(self, reply_meta: dict):
+        """The prospect whose sent email this reply answers, by Message-ID."""
+        ids = self._header_ids(
+            reply_meta.get("in_reply_to", ""), reply_meta.get("references", "")
+        )
+        if not ids:
+            return None
+        # In-Reply-To first, then References newest to oldest.
+        ids = ids[:1] + list(reversed(ids[1:]))
+        item = await self._outbox_from_ids(ids)
+        if item and item.get("prospect_id"):
+            return await self.state.get_prospect(item["prospect_id"])
+        return None
+
     async def _handle_bounce(self, msg):
-        """A bounce is a data bug AND a reputation threat. Fix both."""
-        outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+        """A bounce is a data bug AND a reputation threat. Fix both.
+
+        Matched to the sent email by the original Message-ID inside the
+        bounce report, then In-Reply-To/References, then by the failed
+        recipient address. Delay notices are logged, never suppressed.
+        """
+        ids = self._header_ids(
+            getattr(msg, "original_message_id", ""), msg.in_reply_to,
+            getattr(msg, "references", ""),
+        )
+        outbox_item = await self._outbox_from_ids(ids)
         prospect = None
         if outbox_item:
             prospect = await self.state.get_prospect(outbox_item["prospect_id"])
+        recipients = list(getattr(msg, "bounce_recipients", []) or [])
+        if prospect is None:
+            for address in recipients:
+                prospect = await self.state.get_prospect_by_email(address)
+                if prospect:
+                    break
 
-        if prospect:
-            await self.state.update_prospect_email(
-                prospect.id, prospect.email, "invalid"
+        status = getattr(msg, "bounce_status", "") or "unknown"
+        if not is_permanent_bounce(msg):
+            await self.state.log_action(
+                action_type="bounce_delayed", agent="handler",
+                details={"prospect": prospect.email if prospect else "unknown",
+                         "recipients": recipients, "status": status,
+                         "subject": msg.subject[:120]},
             )
-            cancelled = await self.state.cancel_pending_outbox_for_prospect(
-                prospect.id, reason="bounced"
+            logger.info(
+                f"Handler: delivery delay/notice ({status}) for "
+                f"{prospect.email if prospect else recipients or 'unknown'}; not a bounce."
             )
-            logger.warning(
-                f"Handler: BOUNCE for {prospect.email} — marked invalid, "
-                f"cancelled {cancelled} queued email(s)."
-            )
-        else:
+            return
+
+        if prospect is None and not recipients:
             logger.warning(
                 f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
-                "match it to a sent email."
+                "match it to a sent email or an address."
             )
-
-        bounces = await self.state.increment_setting(BOUNCE_COUNT_KEY)
-        total_sent = await self.state.count_outbox_sent()
-        await self.state.log_action(
-            action_type="bounce",
-            agent="handler",
-            details={"prospect": prospect.email if prospect else "unknown",
-                     "bounces": bounces, "total_sent": total_sent},
+        await record_hard_bounce(
+            self.state, self.config, prospect, recipients,
+            reason=f"bounced: {status}", source="handler",
         )
-
-        max_rate = getattr(self.config.channels.email, "max_bounce_rate", 0.05)
-        if (
-            max_rate > 0
-            and total_sent >= MIN_SENDS_FOR_KILL_SWITCH
-            and bounces / total_sent > max_rate
-        ):
-            reason = (
-                f"bounce rate {bounces}/{total_sent} exceeded "
-                f"{max_rate:.0%} — check list quality before resuming"
+        if prospect is not None:
+            logger.warning(
+                f"Handler: BOUNCE ({status}) for {prospect.email} — suppressed "
+                "and marked invalid."
             )
-            await self.state.set_setting(KILL_SWITCH_KEY, reason)
-            logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
 
     async def _queue_native_reply(
         self, response: str, prospect, convo, reply_meta: dict, intent: str

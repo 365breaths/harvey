@@ -58,6 +58,9 @@ class FakeProvider(MailProvider):
         return True, "fake"
 
 
+from harvey.config import ComplianceConfig, FooterConfig
+
+
 class Cfg:
     class persona:
         name = "Harvey"; email = "harvey@x.co"; company = "X"; role = "BD"; tone = "direct"
@@ -77,6 +80,10 @@ class Cfg:
 
         class linkedin:
             enabled = False
+
+    compliance = ComplianceConfig(
+        footer=FooterConfig(postal_address="1 Test St, Testville")
+    )
 
 
 class Env:

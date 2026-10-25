@@ -12,7 +12,7 @@ upgrade cleanly in place.
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -412,6 +412,48 @@ MIGRATIONS: list[str] = [
     -- claude_calls keeps meaning Claude calls; Codex calls count separately
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
+    """,
+    # ── v12: send-attempt log, suppression list, retry bookkeeping ──
+    """
+    -- One row per call to the mail server, never overwritten: what was
+    -- tried, when, and exactly what the server answered. "accepted" means
+    -- the server took the message, not that it reached the inbox.
+    CREATE TABLE IF NOT EXISTS send_attempts (
+        id TEXT PRIMARY KEY,
+        outbox_id TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        to_email TEXT DEFAULT '',
+        provider TEXT DEFAULT '',
+        outcome TEXT DEFAULT '',
+        smtp_code INTEGER DEFAULT 0,
+        smtp_response TEXT DEFAULT '',
+        message_id TEXT DEFAULT '',
+        error TEXT DEFAULT '',
+        attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_send_attempts_outbox ON send_attempts(outbox_id);
+    CREATE INDEX IF NOT EXISTS idx_send_attempts_outcome ON send_attempts(outcome);
+
+    -- Addresses (or whole domains, stored as '@domain.com') that must never
+    -- be emailed again. Kept apart from prospects so it survives a contact
+    -- being deleted or re-imported, and checked before every send.
+    CREATE TABLE IF NOT EXISTS suppressions (
+        email TEXT PRIMARY KEY,
+        reason TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    ALTER TABLE outbox ADD COLUMN attempts INTEGER DEFAULT 0;
+    ALTER TABLE outbox ADD COLUMN smtp_code INTEGER DEFAULT 0;
+    ALTER TABLE outbox ADD COLUMN smtp_response TEXT DEFAULT '';
+
+    INSERT OR IGNORE INTO suppressions (email, reason, source)
+        SELECT lower(trim(email)), 'opted_out', 'backfill' FROM prospects
+        WHERE status = 'opted_out' AND trim(email) != '';
+    INSERT OR IGNORE INTO suppressions (email, reason, source)
+        SELECT lower(trim(email)), 'invalid', 'backfill' FROM prospects
+        WHERE email_status = 'invalid' AND trim(email) != '';
     """,
 ]
 
@@ -887,6 +929,7 @@ class StateManager:
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
         "subject", "body", "send_at", "provider",
+        "attempts", "smtp_code", "smtp_response",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -940,12 +983,51 @@ class StateManager:
                 return (await cursor.fetchone())[0]
 
     async def count_outbox_sent_today(self) -> int:
+        """Emails that left (or may have left) today. In-flight and
+        uncertain sends count too: the cap errs toward sending less."""
         async with self._connect() as db:
             async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
-                "AND date(sent_at) = date('now')"
+                "SELECT COUNT(*) FROM outbox "
+                "WHERE status IN ('sent', 'sending', 'uncertain') "
+                "AND date(COALESCE(sent_at, updated_at)) = date('now')"
             ) as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def claim_outbox_item(self, item_id: str, message_id: str = "") -> bool:
+        """approved -> sending, atomically, just before the provider call.
+        A row left in 'sending' means the outcome was never recorded (crash),
+        and it is never picked up for sending again."""
+        async with self._connect() as db:
+            if message_id:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'sending', message_id = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'approved'",
+                    (message_id, _utcnow().isoformat(), item_id),
+                )
+            else:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'sending', updated_at = ? "
+                    "WHERE id = ? AND status = 'approved'",
+                    (_utcnow().isoformat(), item_id),
+                )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def mark_stuck_sending_uncertain(self, older_than_minutes: int = 15) -> int:
+        """Rows still 'sending' long after their attempt: Harvey stopped
+        between handing the email to the server and writing down what
+        happened. It may have gone out, so they become 'uncertain' for a
+        human to check, never retried."""
+        cutoff = (_utcnow() - timedelta(minutes=older_than_minutes)).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'uncertain', "
+                "error = 'interrupted mid-send: may or may not have been sent', "
+                "updated_at = ? WHERE status = 'sending' AND updated_at < ?",
+                (_utcnow().isoformat(), cutoff),
+            )
+            await db.commit()
+            return cursor.rowcount
 
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:
@@ -953,10 +1035,113 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM outbox WHERE message_id = ?", (message_id,)
+                "SELECT * FROM outbox WHERE message_id = ?", (message_id.strip(),)
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Send attempts (append-only) ──
+
+    async def log_send_attempt(
+        self,
+        *,
+        outbox_id: str,
+        prospect_id: str,
+        to_email: str,
+        provider: str,
+        outcome: str,
+        smtp_code: int = 0,
+        smtp_response: str = "",
+        message_id: str = "",
+        error: str = "",
+    ) -> str:
+        attempt_id = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO send_attempts
+                   (id, outbox_id, prospect_id, to_email, provider, outcome,
+                    smtp_code, smtp_response, message_id, error, attempted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attempt_id, outbox_id, prospect_id, _norm(to_email), provider,
+                    outcome, int(smtp_code or 0), (smtp_response or "")[:500],
+                    message_id or "", (error or "")[:500], _utcnow().isoformat(),
+                ),
+            )
+            await db.commit()
+        return attempt_id
+
+    async def get_send_attempts(self, outbox_id: str = "", limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM send_attempts"
+        params: list = []
+        if outbox_id:
+            sql += " WHERE outbox_id = ?"
+            params.append(outbox_id)
+        sql += " ORDER BY attempted_at DESC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def count_delivery_attempts(self) -> int:
+        """Denominator for the bounce rate: emails accepted by the server
+        plus emails the server refused outright for a bad address."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT (SELECT COUNT(*) FROM outbox WHERE status = 'sent') + "
+                "(SELECT COUNT(*) FROM send_attempts WHERE outcome = 'recipient_rejected')"
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    # ── Suppression list ──
+
+    async def add_suppression(self, email: str, reason: str, source: str = "") -> bool:
+        """Never email this address (or '@domain') again. True if new."""
+        key = _norm(email)
+        if not key:
+            return False
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO suppressions (email, reason, source, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (key, (reason or "")[:300], source, _utcnow().isoformat()),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def remove_suppression(self, email: str) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM suppressions WHERE email = ?", (_norm(email),)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_suppression(self, email: str) -> str:
+        """The reason an address is suppressed (itself or its domain), or ''."""
+        key = _norm(email)
+        if not key:
+            return ""
+        keys = [key]
+        if "@" in key:
+            keys.append("@" + key.rsplit("@", 1)[1])
+        async with self._connect() as db:
+            async with db.execute(
+                f"SELECT email, reason FROM suppressions WHERE email IN "
+                f"({', '.join('?' for _ in keys)}) LIMIT 1",
+                keys,
+            ) as cursor:
+                row = await cursor.fetchone()
+                return f"{row[1] or 'suppressed'} ({row[0]})" if row else ""
+
+    async def list_suppressions(self, limit: int = 500) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM suppressions ORDER BY created_at DESC LIMIT ?", (int(limit),)
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 

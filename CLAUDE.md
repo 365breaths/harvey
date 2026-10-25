@@ -271,7 +271,8 @@ harvey gmail test            # Verify the Gmail connection
 harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
-harvey sending pause|resume  # Kill switch for all outbound
+harvey sending pause|resume  # Kill switch for all outbound (checked before every email)
+harvey suppress [list|add|remove] <email|@domain>  # Do-not-email list (opt-outs, bounces, manual)
 ```
 
 ### Common Issues
