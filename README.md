@@ -13,21 +13,23 @@ $ harvey run
 Harvey is online. Always Be Closing.
 ============================================================
 Checking pipeline state...
-Decision: prospect (only 3 new prospects; pipeline needs leads)
-  discover  → 41 businesses in Portland, OR       ($0.00, OpenStreetMap)
-  profile   → 41 sites read, 288 observations     (free, no model calls)
-  scout     → 12 scored against your ICP
-Decision: write_campaign (12 new prospects with no drafts)
-  writer    → 3-email sequence for Cascade Landscaping
-  outbox    → 12 emails waiting for your approval
+Decision: handle_replies (2 new replies)
+  handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
+  handler   → Priya Nair, Highline Roofing         objection, answer drafted
+Decision: write_campaign (3 new prospects with no drafts)
+  writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
+  outbox    → 5 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
 ```
 
-And the dashboard it keeps, at `localhost:5555` — confirming a signal, building a
-cohort out of the confirmed ones, pricing a discovery run before it spends
-anything, and approving mail one message at a time:
+And the dashboard it keeps, at `localhost:5555`. In this order: the Today screen, a
+conversation Harvey handed back because a prospect asked for a contract, approving
+a drafted reply from the outbox, confirming a signal, building a cohort from
+confirmed signals, searching contacts, and the same screen in dark mode:
 
-![Harvey's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
+![Harvey's dashboard: the Today screen, a conversation handed back for a human, approving a reply in the outbox, confirming a signal and building a cohort, searching contacts, then dark mode](docs/dashboard.gif)
+
+<sub>The demo data is invented: "Bookwell" selling online booking to roofers, dental practices and HVAC shops, on `.test` domains.</sub>
 
 ---
 
@@ -58,6 +60,8 @@ anything, and approving mail one message at a time:
 Every other autonomous sales agent bills you per token. That is the whole reason they cost what they cost: an agent that thinks in a loop, all day, is an agent that burns API credits in a loop, all day. Vendors solve this by thinking less — shorter prompts, cheaper models, fewer passes.
 
 Harvey uses the subscription-backed CLI for the provider you choose: `claude` for Claude Code, or an isolated `codex app-server` for Codex. Both return text with model tools disabled. Harvey handles the prospecting and mail operations itself.
+
+Claude calls run with none of your own Claude Code setup: no `CLAUDE.md` (yours, the project's or any parent folder's), no hooks, skills, plugins, MCP servers or settings files, no tools, in an empty temporary folder, and nothing saved to your Claude transcripts. Your login (subscription or `claude setup-token`) and any admin-managed policy still apply. This needs a Claude CLI with `--safe-mode`; with an older one Harvey pauses instead of sending prompts unisolated and says to run `claude update`. To check this offline against your installed CLI, with no credentials or network: `HARVEY_CLAUDE_CLI_TESTS=1 pytest tests/test_claude_cli_isolation.py`.
 
 Your selected subscription covers model calls, subject to its usage limits. That lets Harvey use its skills library for personalization and reply handling without a separate model API bill.
 
@@ -108,6 +112,7 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 - **Python 3.11+** — check with `python3 --version`. macOS ships 3.9; if that's what you have, `brew install python@3.13` first.
 - An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`) — or, opt-in, a **ChatGPT plan with the Codex CLI** ([see below](#using-a-chatgpt-plan-instead-codex))
 - A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*. Microsoft 365 works too ([setup](docs/microsoft365.md))
+- A warmup service on that mailbox — we recommend [TrulyInbox](https://trulyinbox.com/?via=harvey). It warms a new mailbox before cold email, keeps it out of spam after, and Harvey reads its inbox rate to tell you when you're ready ([Warmup](#warmup-with-trulyinbox))
 
 ### Easiest: let Claude set it up
 
@@ -129,7 +134,8 @@ python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
 # 2. Configure — every variable is documented inline with where to get it
 cp .env.example .env && $EDITOR .env
 
-# 3. Learn your product from your website
+# 3. Learn your product from your website (writes harvey.local.yaml; re-running
+#    it updates the product, targeting and company and keeps your other settings)
 harvey train https://your-company.com
 
 # 4. Choose what makes a good prospect (see below — this one matters)
@@ -139,7 +145,7 @@ harvey signals --confirm free
 harvey discover
 
 # 6. Watch it work
-harvey dashboard          # http://localhost:5555
+harvey dashboard          # prints a private link to http://127.0.0.1:5555
 harvey run
 ```
 
@@ -149,11 +155,11 @@ harvey run
 
 This is the part that makes Harvey different from a black box, and it is deliberately not skippable.
 
-Harvey knows how to collect **23 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
+Harvey knows how to collect **29 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
 
 ```bash
 harvey signals                       # review the catalog
-harvey signals --confirm free        # everything that costs nothing (21 of them)
+harvey signals --confirm free        # everything that costs nothing (26 of them)
 harvey signals --confirm SERP_RANK   # a paid one, opted into explicitly
 ```
 
@@ -161,7 +167,8 @@ Every signal shows what it is in plain language, **what it costs**, and how many
 
 | | Signal | What it tells you |
 |---|---|---|
-| **Discovery** | `SERP_RANK` | Where they rank for their own core search. Positions 11–30 are the sweet spot: visible enough to be trying, and losing. |
+| **Discovery** | `SERP_RANK` | Where they rank for their own core search, stored with the search phrase. Positions 11–30 are the sweet spot: visible enough to be trying, and losing. |
+| | `IN_LOCAL_PACK` / `MAPS_RANK` | Whether they hold one of the three map slots above the results, and where they sit in Google Maps. |
 | | `NO_WEBSITE` | They have a listing and a phone and no site. If you sell websites, the highest-intent signal that exists. |
 | | `UNCLAIMED_LISTING` | Nobody has claimed their Google Business Profile. |
 | | `REVIEW_RATING` / `REVIEW_COUNT` | Good but invisible, or visible but struggling. |
@@ -170,13 +177,15 @@ Every signal shows what it is in plain language, **what it costs**, and how many
 | | `NO_ONLINE_BOOKING` | Leads have to phone in, so after-hours demand is lost. |
 | | `NO_SCHEMA_MARKUP` | A concrete, checkable SEO gap you can name in an email. |
 | | `BLOG_STALE` | Content marketing started and abandoned. |
-| | `SITE_PAGE_COUNT`, `TECH_STACK`, `BLOCKS_AI_CRAWLERS`, `HIRING_ROLE` | Size, platform, AI-search visibility, and what they're hiring for. |
+| | `SITE_PAGE_COUNT`, `TECH_STACK`, `BLOCKS_AI_CRAWLERS` | Size, platform, AI-search visibility. |
+| | `HIRING_ROLE` / `OPEN_ROLES` | What they're hiring for, and how many roles are open. When their site links a Greenhouse, Lever, Ashby or Workable board, Harvey reads that board's public feed (one request): roles matching `icp.hiring_signals` (else `icp.titles`), with department, location, posting date and the posting's URL; when the board lists none, it records "not hiring" so a closed role stops counting. Otherwise it reads the careers page. Set `hiring_signals` to the roles that mean they're buying: the `titles` fallback names who you email, so "CEO" only matches a CEO opening (never "Assistant to the CEO"), which is rarely the signal you want. |
+| | `YC_BACKED`, `ACCELERATOR`, `FUNDING_ROUND` | A startup, as its own site says: YC or another accelerator (with the batch or cohort), or a raise it announced (round, amount, date). |
 | **People** | `CONTACT_FOUND`, `DECISION_MAKER_TITLE`, `LIKELY_OWNER`, `REGISTRY_VERIFIED` | Who decides, and whether they own the place. |
 | **Contact** | `EMAIL_PATTERN`, `EMAIL_STATUS`, `CONTACT_FORM_URL` | Whether you can actually reach them. |
 
 ### Then a cohort is a query, not a list
 
-Once signals are confirmed, the dashboard's cohort builder turns them into a target set — pick what a good prospect **must have** and what **disqualifies** them, and it counts the matches live:
+Once signals are confirmed, the dashboard's cohort builder turns them into a target set — pick what a good prospect **must have**, what **disqualifies** them, and a **range** for numeric signals (organic rank 11 to 30), and it counts the matches live:
 
 ```
 Has a marketing agency  AND  running Google Ads  AND NOT  already has online booking
@@ -204,9 +213,55 @@ harvey discover               # go
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
 | **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront: OSM maps premises, so whole trades are barely present (under 2,000 roofers and under 2,300 plumbers in the entire US). Harvey says so in the UI rather than quietly under-delivering. |
+| **TinyFish** | free | 30 searches a minute, 500 an hour, no card | Finding businesses by phrase (including the startup and hiring presets) at no cost. Records no search rank: its ordering isn't Google's and it takes no location, so use Serper or DataForSEO SERP for rank signals. |
 | **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
-| **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
+| **DataForSEO SERP** | $0.006 / search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Organic rank as the buying signal, plus who holds the local 3-pack, searched from the city centre. |
+| **DataForSEO Google Maps** | $0.002 / search (up to 100 results) | $1 credit + free sandbox | Map rank, rating, category and claimed status, including businesses with no website. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
+
+**Selling to startups?** Harvey has a built-in startup skill, made of three
+parts:
+
+- **The searches** (each a web search, so Serper or DataForSEO SERP):
+
+  | Preset | Finds | Signal |
+  |---|---|---|
+  | `yc` (*YC startups*) | Companies whose own site says they're backed by Y Combinator | `YC_BACKED`, with the batch (W24, S23) |
+  | `accelerator` (*Accelerator startups*) | Ones backed by Techstars, 500 Global, Antler, Entrepreneur First, South Park Commons, Neo, AI Grant, a16z speedrun or Plug and Play (two searches per industry; the signal also reads Pioneer) | `ACCELERATOR`, with the program and cohort ("Techstars 2024") |
+  | `funding` (*Recently funded*) | Companies announcing their own raise ("we raised", "announces $X Series A") in the last 18 months, news sites and funding databases excluded | `FUNDING_ROUND`: round, amount and date |
+
+  `harvey discover --preset accelerator --provider serper`, or the *Look for*
+  menu on the Discover tab.
+- **The signals:** turn them on in the Signals tab. They read the homepage and
+  About page (and for a raise, the page the search found on their own site and
+  their press or news page) for a line where the company says it about itself
+  ("we went through Y Combinator", "Acme (Techstars '24)", "we raised a $4M
+  seed round"), a "Backed by" logo wall, or a link to its own YC page. Customer
+  and audience lines ("trusted by YC-backed startups", "we help founders raise
+  their seed round") don't count. Many startups never say it on their site, so
+  these find the ones that do; a YC or accelerator preset hit counts as a yes too.
+  A raise's date comes from its own clause, or from the publish date of a
+  press, news or blog post. Money that isn't a raise (loans closed, verdicts
+  won, money raised for a charity, an investor's round in another company)
+  doesn't count.
+- **The writing:** the writer and reply handler use
+  `skills/selling_to_startups.md`, a playbook for writing to founders with a
+  section on companies that just raised, for YC- and accelerator-backed
+  companies and for raises dated within the last 18 months. An older or
+  undated raise alone doesn't bring the playbook, and is never written to as
+  news.
+
+Harvey never reads ycombinator.com, the accelerators' directories, Crunchbase,
+PitchBook or LinkedIn, whose terms forbid scraping them; everything comes from
+the companies' own sites and your search provider.
+
+**Looking for companies hiring a role?** `harvey discover --preset hiring
+--provider serper` (or *Look for: Companies hiring for your roles*) searches
+your industries for companies whose own careers pages list one of your
+`icp.hiring_signals` roles (else `icp.titles`). Hosted boards and job sites
+are left out of the search, since a board page names a board, not a website
+to profile. Confirm `HIRING_ROLE` and profiling reads the board their site links
+to and records the role; the search hit alone records nothing.
 
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
@@ -216,17 +271,34 @@ Cities geocode themselves (cached forever, one lookup each). Directories, aggreg
 
 **Free.** Three HTTP requests per business. No browser, no model call. This is the highest value-per-effort stage in the whole system, because it produces the facts that make an email specific.
 
+Website requests from Scout, Profile, and the local training crawler are limited
+to public HTTP(S) destinations. Every DNS answer and redirect is checked; local,
+private, link-local, and metadata addresses are rejected. Connections use a
+validated IP while preserving the website's TLS identity. These website clients
+ignore environment proxies, so proxy routing cannot bypass that boundary.
+
 Homepage, `robots.txt`, `sitemap.xml`, plus the team and careers pages when they exist — then regex over HTML already in hand. Out comes the incumbent agency, the ad pixels, the missing schema, the abandoned blog, the open roles, the named humans.
 
 Agency detection is the compounding one. Almost every agency credits itself in the footer, and Harvey scores the wording: *"Powered by"* / *"Website by"* → 0.9 confidence; a bare descriptive link → 0.75; an unlabelled link → 0.35 and **not recorded**. A wrong incumbent in an email is worse than saying nothing.
 
 ### 3. ENRICH — who decides
 
-Free public registries first. Name plus title from the team page, confirmed against an authoritative registry where one exists — which also filters out your own parsing artifacts, because a "person" who matches nothing usually wasn't one.
+The owner, from the company's own site. Harvey reads the homepage and follows the site's own menu to the pages where people are named — team, about, our story, meet the dentists, attorneys, contact — six pages at most, skipping links that land back on the homepage. On those pages it reads:
+
+- **cards and lists**: a name with a title under it, even when the title is only a `<br>` away inside a span;
+- **sentences**: "owned and operated by Gary Pruitt", "led today by President Ilan Brooks", "Ines Varga started Countwise";
+- **schema.org**: the business's own `founder` and `employee` entries (a blog post's author is not staff);
+- **the name on the door**: when two people both have owner titles, the one whose surname is in the business name comes first. A surname alone never makes anyone the owner: Linda Smith, Office Manager, at Smith & Sons isn't one.
+
+Owners rank first, and at most two people per company become prospects. Headings made of ordinary words ("Team of Experts"), customers quoted in testimonials or tweets ("Founder at Quillnest"), other organisations' officers ("KTR President Vic Hale"), former or late owners ("Past President", "the late Harold Smith"), and taglines are not people. Titles match your ICP by whole word: "Vice President" doesn't count as "President" unless you list it, and Proprietor, Principal, Managing Partner, Founder and CEO all count as an owner. With `LIKELY_OWNER` confirmed, each owner is recorded as an observation with the evidence that says so.
+
+When a company's site names nobody, or names an owner whose address is only a guess, and Harvey has no contact there yet — common for small trades — it also uses a general address the company prints on its own pages (only general mailboxes such as `owner@`, `office@`, `info@` or `hello@`, never a person's own address). Harvey reads whole pages for it, including schema.org and addresses hidden from scrapers, and accepts an address on another domain only when that domain leads to the company's own site. It is never guessed, it is verified like any other address, and those emails greet the company's team instead of a first name.
+
+A site behind a bot challenge (SiteGround's "sgcaptcha", Cloudflare's "Just a moment…") is reported as challenged, not unreachable, and isn't retried.
 
 ### 4. VERIFY — can you reach them
 
-Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
+Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Any address the site publishes can teach it: `nvale@` next to Nora Vale is `{first initial}{last}`, and `j.smith@` is an initial and surname. A lone dotless address no named person owns (`kmorrow@`: Kmorrow, or K. Morrow?) is ambiguous and teaches nothing. An address two named people could own (`jsmith@` when John and Jane Smith both work there) is format evidence only, and Harvey never guesses or verifies an address another named person could own: a verifier would confirm *their* mailbox. It decodes the usual hiding tricks (Cloudflare email protection, a mail link's `data-user`/`data-domain` attributes, `name [at] domain [dot] com`) and never invents an address from ordinary text. A person's own published address is used as is. With no evidence at all, it guesses `first.last@`, or `first@` when something besides the website says the company is small (your ICP's company size, or a local-business listing as its source). A cached guess never stops a real address or a Hunter lookup from replacing it, and Hunter is asked once per domain (a timeout or rate limit doesn't count). Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
 
 Every address is tagged honestly: `verified` / `risky` (catch-all) / `guess` / `invalid`. **Only deliverable ones are ever sent to.** A guess is never treated as a win.
 
@@ -297,7 +369,7 @@ Harvey feels like one agent. Underneath it's five, each loaded with different sk
 |---|---|
 | **Scout** | Scores and personalizes what the collectors found. Python does the searching and the email resolution; the selected model is used only where judgment is actually needed — which is what keeps the token cost sane. |
 | **Writer** | Generates 3-email sequences. Email 1 under 75 words, email 2 under 75, email 3 under 40. Hard ban list on AI-sounding language. |
-| **Sender** | Renders merge variables per prospect and stages each email into the outbox with a send time. Drains due and approved items with human-like pacing, enforcing the daily cap and stop-on-reply. |
+| **Sender** | Renders merge variables per prospect and stages each email into the outbox with a send time. Drains due and approved items with human-like pacing, enforcing the daily cap and stop-on-reply: a reply from anyone at a company stops the sequence to everyone there. |
 | **Handler** | Polls for replies, dedups them, classifies intent, advances the conversation stage, and queues responses through the same approval ladder. Detects bounces, marks the address invalid, cancels that prospect's queued sends, and trips a global kill switch past a bounce-rate threshold. |
 | **Analyst** | Runs on idle cycles. Pipeline stats, campaign performance, intent distribution, what's actually working. |
 
@@ -315,41 +387,118 @@ The dashboard's Outbox is a decisions desk: one email fills the pane, the rest w
 harvey outbox                 # review from the terminal
 harvey outbox --approve-all
 harvey sending pause          # kill switch, stops everything mid-flight
+harvey retry-writes           # retry prospects the Writer gave up on after 3 unusable drafts
 ```
 
 Before anything leaves, a **deterministic pre-send gate** — no model involved — rejects: unrendered merge tags, banned phrases, emails over the length cap, too many links, HTML bodies, non-deliverable addresses, and any mismatch between the recipient and the database record.
 
 Optionally, the same step can ask [Precleared](https://precleared.dev) whether cold email to each new address is allowed before the first one goes out. See [Legal and deliverability](#legal-and-deliverability).
 
-When you trust it, set `channels.email.require_approval: false` for full autopilot.
+**Office hours in the recipient's time zone.** Set `channels.email.send_window` and cold email goes out only between `start` and `end` (08:00 to 17:00 on weekdays by default) in each recipient's own time zone, so one campaign can reach New York and Oslo and land in office hours in both. Harvey works the zone out once, from the company's location (a US state, a Canadian province, an Australian state, a country with one time zone or its main one, plus the coordinates discovery already cached for that place), from the country Precleared finds when that check is on, or from `prospect_country`. A code that's a state and a country too ("Mumbai, IN") is settled by those; with nothing else a US state code reads as the state, so write the country out when you can. Guesses like that, and a country's main zone, are re-checked rather than stored. Anyone it can't place gets the window in `usage.quiet_hours.timezone`. Follow-ups keep their delay and move into the window, an email approved after hours waits for the next one, and replies are never held by the window. `weekdays_only` means Monday to Friday everywhere. Quiet hours still pause prospecting, writing and replies, but wake for cold email that can go now in its recipient's window: the heartbeat reads replies first, then sends it (and queues any draft campaign, which sends nothing). Gmail, Microsoft and SMTP only.
+
+### Approval or autopilot
+
+Harvey has two sending modes. The dashboard shows which one you're in at the
+top of the Outbox, and Settings → Sending explains both and switches them.
+
+| | **Approval** (the default) | **Autopilot** |
+|---|---|---|
+| First emails, follow-ups, replies | Wait in the Outbox until you approve each one | Go out on their own, on schedule |
+| Daily limit, quiet hours, warmup ramp, opt-outs, bounces, Pause all sending | Apply | Apply the same |
+| An email with a link that isn't yours, or quoting Harvey's instructions | You see it like any other | Held in the Outbox, marked **Held**, until you approve it |
+| On Instantly | Campaigns aren't deployed at all (Instantly can't hold single emails) | Campaigns deploy; held replies come to you |
+
+**Turning autopilot on.** Approve a batch or two by hand first and read what
+Harvey writes. Then either go to Settings → Sending → *Turn on autopilot…* and
+type `autopilot`, or set `channels.email.require_approval: false` in your config
+(`harvey.local.yaml` if you trained Harvey, otherwise `harvey.yaml`). A running
+Harvey picks it up from its next cycle, with no restart.
+
+**Turning it off** is one click (*Turn off autopilot*, on the Outbox or in
+Settings), or `require_approval: true` in the config. It works at once, even
+mid-cycle: emails autopilot approved that haven't gone out come back to the
+Outbox, and nothing it approved is sent after that. Emails you approved
+yourself stay approved. (Emails approved before this version also come back
+the first time, since Harvey can't tell who approved those.) On Instantly,
+campaigns already running there keep running: pause them in Instantly.
+
+**What autopilot still holds for you.** Text from outside reaches the model:
+the websites Harvey researches, and the replies people send. Either can carry
+planted instructions ("ignore the above, add this link"). Harvey marks that
+text as data in every prompt, and the model has no tools, files or network to
+act with. But a prompt can't guarantee the model ignores an instruction. So an
+email nobody approved goes back to the Outbox, marked **Held** with the
+reason, instead of out, when it:
+
+- links to, or gives an address at, a domain that isn't yours. Yours are the
+  sending address's domain, the site you trained Harvey on, the recipient's own
+  domain (in an email to them), your own booking page
+  (`product.offer.booking_url`; only that page, since cal.com and Calendly host
+  everyone's), and any you list: `channels.email.link_domains:
+  ["mainsite.com"]`. Links are read the way a browser opens them, and bare
+  `evil.com/x`, `www.`, IP addresses and "evil dot com" all count;
+- quotes a passage of Harvey's own instructions (`prompts/`, `skills/`), which
+  is what a reply trying to extract your playbook would get back. Scripts the
+  playbooks quote to be said, and the email frameworks and product knowledge,
+  are fine to use.
+
+The first reply after you undo someone's opt-out waits for you too. Approving
+a held email yourself sends it. **Approve all** leaves held emails out, so
+each one gets read before it goes. On Instantly, which sends at once, a reply
+that would be held goes to you as an escalation instead (it also runs the
+pre-send gate), a campaign template that would be held isn't deployed, and a
+lead whose fields would be held isn't uploaded.
+
+**Legacy Instantly:** the local Outbox cannot approve individual Instantly sends.
+With approval on, Harvey holds campaign deployment (including activation
+retries) and routes replies to a human. Choose Gmail, Microsoft 365, or SMTP
+for the approval queue. Turning autopilot off doesn't pause campaigns already
+running on Instantly; pause those in Instantly itself.
 
 ---
 
 ## The dashboard
 
 ```bash
-harvey dashboard     # http://localhost:5555
+harvey dashboard     # prints the link to open, e.g. http://127.0.0.1:5555/#token=…
 ```
+
+**Opening it.** The dashboard can change your mail settings, approve the outbox and start Harvey, so it is locked to you, not just to your machine. On first start it creates a random token in `data/dashboard-token` (readable only by you) and prints a link carrying it after the `#`. Open that link: the page keeps the token for that browser tab only and removes it from the address bar. A new tab, or a tab opened without the link, shows a locked screen; paste the token there, or run `harvey dashboard --url` to print the link again. Every API request needs the token as an `Authorization: Bearer` header — scripts and `curl` included — and the token is never accepted from a cookie or a query string. Delete `data/dashboard-token` and restart the dashboard to replace it.
+
+**It only listens on this machine.** `--host` accepts loopback addresses only (`127.0.0.1`, `::1`, `localhost`), and requests must name one of them in their `Host` header, which also stops a DNS name pointed at 127.0.0.1 from reaching it. Requests sent by other websites open in your browser are refused. To use it from another computer, tunnel instead of exposing it: `ssh -L 5555:127.0.0.1:5555 your-machine`, then open the printed link locally. The token protects against other users and other websites, not against programs already running as your own user account, which can read the token file just as they can read `.env` or the database.
+
+**Windows:** the token file is protected by the permissions of the folder it lives in (your user profile normally restricts this to you); Harvey doesn't apply POSIX file modes there.
 
 Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
 
-- **Today** — an asymmetric two-column screen: anything waiting on a decision down the left with the activity feed beneath it, and a rail carrying pipeline figures, collector runs and setup. It opens here rather than on a setup checklist, because the question you actually have is "is anything waiting on me?" Setup lives in the rail and disappears entirely once it's done.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/today-dark.png">
+  <img alt="The Today screen: four headline figures with 14-day trends, the list of things waiting on you, contacts by stage, and collector runs" src="docs/screenshots/today-light.png">
+</picture>
+
+The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeline** (what Harvey is building) and **System** (how it's running). Counts next to a tab mean something is waiting there.
+
+**Work**
+- **Today** — four headline figures with 14-day trends (contacts found, emails sent, conversations, waiting on you), then everything that needs a decision, contacts by stage, collector runs and what the pipeline is doing right now. Setup shows here until it's finished, then disappears.
+- **Outbox** — the decisions desk. Each email sits next to what Harvey knew when it wrote it: the company, how the address was found and verified, and the signals the email draws on. `J`/`K` to move, `A` approve, `E` edit, `R` reject.
+- **Conversations** — every reply in the context of the emails that led to it. Threads Harvey handed to you (a contract request, a reply it had no safe answer for) come first, with **Hand back to Harvey**, **Close** and **Reopen**.
+
+**Pipeline**
 - **Signals** — the confirmation gate and the cohort builder
-- **Discover** — the provider menu with prices side by side, an estimate, then a run
-- **Companies / Contacts** — everything found, with CSV export
-- **Outbox** — the decisions desk
-- **Conversations** — every reply and how Harvey handled it
-- **Usage** — Claude or Codex quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
+- **Discover** — the provider menu with prices side by side, an estimate, then a run; plus reading the sites of companies found but not yet looked at
+- **Companies / Contacts** — everything found, searchable, with CSV export
+- **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
 
-Three rules hold the interface together:
+**System**
+- **Activity**, **Usage**, **Controls**, **Settings**, **Help**. Usage shows Claude or Codex quota gauges and per-agent token counts, with no dollar figures: you're on a subscription and aren't billed per token, so showing costs would be made up.
 
-**The interface carries no colour.** The chrome is warm greyscale in both modes, so the only coloured thing on screen is status — if something has a hue, it means something.
+| Outbox | Conversations |
+|---|---|
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/outbox-dark.png"><img alt="The outbox decisions desk: a drafted reply to an objection, with the company, contact, verification and signals beside it" src="docs/screenshots/outbox-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/conversations-dark.png"><img alt="A conversation Harvey handed back: the two emails sent, the prospect asking for a contract, and the Hand back to Harvey and Close buttons" src="docs/screenshots/conversations-light.png"></picture> |
 
-**One status vocabulary.** Prospects, campaigns, conversations, the outbox, signals and email deliverability all resolve to the same five tones, so "waiting on you" looks identical wherever it appears.
+Colour is kept for meaning. The chrome is neutral and a single blue marks what you can act on. Status (waiting on you, done, failed, running) uses the same small set of tones in every tab, so "waiting on you" looks the same wherever it shows up. Figures are tabular, so columns line up and a changing number doesn't shift the layout.
 
-**Every figure is monospaced and tabular**, so columns of numbers line up and a value changing doesn't shift the layout.
-
-Appearance has three states, not two. `auto` follows your OS and is the default, so the dashboard matches the rest of your machine until you deliberately pick light or dark. Dark isn't a separate design — it's the same design re-tokenised.
+Appearance has three states: `auto` follows your OS and is the default, or pick light or dark from the button at the bottom of the sidebar. Dark mode uses the same layout with a different set of colour tokens.
 
 ---
 
@@ -393,9 +542,10 @@ product:      { name, description, pricing, key_benefits, objection_responses, o
 icp:          { industries, titles, company_size, geography, hiring_signals, geo_coordinates }
 channels:
   email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, require_approval,
-                send_to_risky, max_bounce_rate }
+                send_to_risky, max_bounce_rate, warmup, send_window }
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
+writer:       { humanizer }   # optional; true adds one editing pass per batch using ~/.claude/skills/humanizer/SKILL.md
 ```
 
 `max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).
@@ -406,7 +556,7 @@ If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real
 
 ```bash
 harvey run                   # the heartbeat loop
-harvey dashboard             # web UI at localhost:5555
+harvey dashboard             # web UI at 127.0.0.1:5555 (--url: print the unlock link)
 harvey signals               # review/confirm what to prospect against
 harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
@@ -416,9 +566,18 @@ harvey usage                 # active provider's quota + per-agent tokens
 harvey outbox                # review queued email
 harvey export                # deliverable prospects → CSV
 harvey sending pause|resume  # kill switch
+harvey warmup [domain]       # is the sending domain ready? (SPF/DKIM/DMARC, age, blocklists, warmup)
+harvey trulyinbox connect    # connect TrulyInbox so Harvey reads the mailbox's warmup
+harvey retry-writes          # retry prospects the Writer gave up on
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
+
+Prospect CSV exports exclude opted-out contacts, including when using
+`--status` or `--email-status` filters. `harvey export --all` is an unfiltered
+raw-data export for inspection: it includes opted-out and unverified contacts
+and should not be imported as an outreach list. The dashboard's prospect CSV
+download follows the same policy; `?all=true` selects its raw export.
 
 
 ## Using a ChatGPT plan instead (Codex)
@@ -458,25 +617,55 @@ What to know:
 
 Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
 
-**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: Harvey treats any opt-out wording as immediate and permanent. Your physical mailing address in the footer — configure this before your first campaign.
+**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Not interested? Reply "no thanks" and I won't email again.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Nothing Harvey does later moves someone off *opted out*: a later message from them is kept for you to read, never answered, and a complaint still goes to you. To see why someone was opted out (the rule that fired, the words, and their message), click **Why?** on their row in Contacts. If it was a mistake, **Undo opt-out** there marks them as replied: Harvey sends nothing on its own, and their next reply gets a draft for your approval. Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Reply "no thanks"`, `Reply STOP`, also "unsubscribe", "remove me", "opt out") and can't contain a link or email address.
+
+**Do not contact.** List competitors, existing customers, or anyone else Harvey must never email under `compliance.do_not_contact`, one address or domain per line, in the config file Harvey reads: `harvey.local.yaml` if you trained Harvey (that file wins), otherwise `harvey.yaml`. A domain covers its subdomains (`acme.example` also blocks `mail.acme.example`, not `notacme.example`), an address covers its plus-tags (`jane@` also blocks `jane+news@`), and a pasted link such as `https://www.acme.example/about` or `Jane Doe <jane@acme.example>` counts as what it names. An entry that is neither an address nor a domain stops Harvey from starting, with the entry named, rather than quietly protecting nobody. A running Harvey picks up an edit at once, and the send gate checks the list as each email leaves, cold or reply, so it holds even for an email you already approved. If someone on the list writes back, Harvey doesn't draft an answer: the conversation comes to you. `harvey export` and the dashboard's Export buttons leave them out too. On Instantly, listed leads are left out of the upload and a reply to one comes to you, but Harvey can't take back a lead Instantly already has: remove it there.
 
 **GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
 
-**Per-recipient check (optional).** Those rules turn on facts about each recipient: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) about each new recipient before the first cold email. Anything other than `ok_to_email` holds that email back, with the rule and the next step shown in the Outbox, and the signed receipt id is logged with every send. One check per address, cached for 30 days (changing the sender country, address source or product description triggers a fresh check); replies are never checked; native providers (Gmail, SMTP) only. Precleared receives the recipient's address, your sender country, the address source and your product description. Without a key it allows 10 checks a day, and a free key (`PRECLEARED_API_KEY`) allows 25. Put the setting in `harvey.yaml`, or in `harvey.local.yaml` if you trained Harvey, since that file wins.
+**Per-recipient check (optional).** Those rules turn on facts about each recipient: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) about each new recipient before the first cold email. Anything other than `ok_to_email` holds that email back, with the rule and the next step shown in the Outbox, and the signed receipt id is logged with every send. One check per address, cached for 30 days (changing the sender country, address source, product description or prospect country triggers a fresh check); replies are never checked; native providers (Gmail, Microsoft 365, SMTP) only. Precleared works out each recipient's country from the address, company records or the company's website; if all your prospects are in one country, also set `prospect_country` (for example `US`), which it uses only when none of those show it. Precleared receives the recipient's address, your sender country, the address source, your product description and, if set, your prospects' country. Without a key it allows 10 checks a day, and a free key (`PRECLEARED_API_KEY`) allows 25. Put the setting in `harvey.yaml`, or in `harvey.local.yaml` if you trained Harvey, since that file wins.
+
+**If the check is held up.** When Precleared can't answer (the day's free checks are used up, the key is out of checks or was rejected, or Precleared can't be reached), cold email waits and replies still go out. The Today page and `harvey status` say how many cold emails are waiting and what fixes it.
 
 **Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
 
 **LinkedIn.** Browser automation violates LinkedIn's ToS and can get the account restricted. Off by default. If you turn it on, use an account you can afford to lose.
 
+LinkedIn requires both `channels.linkedin.enabled: true` and configured
+credentials. Training a product does not enable it; the setup wizard records
+your explicit choice.
+
 **Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
 
 1. Buy a **dedicated sending domain** (`getacme.com`, not `acme.com`).
-2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you.
-3. **Warm up for 2–4 weeks** before real volume.
-4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target.
+2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you. `harvey warmup` checks them, plus domain age, blocklists, your warmup progress and bounce rate, and ends with READY / NOT READY. It only reads public DNS and Harvey's own records.
+3. **Warm up for 2–4 weeks** before real volume, and keep warmup running after. We recommend [TrulyInbox](https://trulyinbox.com/?via=harvey); see [Warmup with TrulyInbox](#warmup-with-trulyinbox).
+4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target. Set `channels.email.warmup.start_date` and Harvey does this for you (Gmail, Microsoft, SMTP; Instantly has its own warmup): no cold email for `min_days`, then a cold-email cap that climbs by `daily_increase` a day. Replies always go out.
 5. **Watch bounces.** Above ~3%, stop and fix list quality. Harvey trips its own kill switch past your configured threshold.
 
 *None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*
+
+### Warmup with TrulyInbox
+
+Whether a mailbox is warmed isn't something DNS can tell you: only the warmup
+service sees where its mail lands. We recommend [TrulyInbox](https://trulyinbox.com/?via=harvey), and Harvey
+connects to it so `harvey warmup` can say whether your mailbox is actually ready:
+
+1. **Get TrulyInbox** at [trulyinbox.com](https://trulyinbox.com/?via=harvey) and add your sending mailbox.
+   Connecting Harvey needs API access, which starts on the Starter plan.
+2. **Create a key.** In TrulyInbox, open Settings > API keys and create a
+   workspace key with `accounts:read`, `warmup:read`, `analytics:read` and
+   `workspace:read`.
+3. **Connect it**: `harvey trulyinbox connect`, or paste it into the warmup step
+   on the dashboard's Today page. Harvey checks the key before saving it to `.env`.
+
+`harvey warmup` then reads the mailbox from TrulyInbox and calls it ready only
+when it's enrolled, signed in, has warmed for `min_days` (14 by default), and
+less than 5% of its warmup mail landed in spam. Harvey only reads: it never
+enrolls, pauses or changes anything in your TrulyInbox account.
+
+Already warming with another service? `harvey trulyinbox other` (or *I use
+another service* on the dashboard) and Harvey stops suggesting it.
 
 ---
 
@@ -490,7 +679,9 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **`SyntaxError` or odd `ImportError`s right after install (macOS)** — Your venv is Python 3.9. `python3 -m venv` builds from `/usr/bin/python3`, which macOS keeps at 3.9. Check with `.venv/bin/python -V`, then rebuild: `rm -rf .venv && python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .`
 
-**Claude headless mode fails** — `claude login`, and confirm the subscription is active. Test with `claude -p "say hi"`. In Docker, mount `~/.claude` into the container.
+**Claude headless mode fails** — `claude login`, and confirm the subscription is active. Test with `claude -p "say hi"`. In Docker, mount `~/.claude` into the container (writable: the CLI refreshes its login there). If the log says the Claude CLI "lacks --safe-mode" (or another flag), run `claude update` (in Docker, rebuild the image); Harvey resumes on its own. If your Claude login depends on `env` or `apiKeyHelper` entries in your Claude settings files, set those variables in Harvey's environment instead: Harvey's calls don't read settings files. `harvey status --check` confirms the CLI without sending a prompt.
+
+**Dashboard says "locked"** — Open the link `harvey dashboard` printed (or `harvey dashboard --url`). If it says the token file can't be used, follow the message: usually delete `data/dashboard-token` and restart the dashboard. Visit it as `127.0.0.1` or `localhost`; other host names are refused.
 
 **Codex calls fail** — Read the log line; every Codex error says what to do. "Not logged in" or "expired or is due for renewal" → use Codex once or run `codex login` with ChatGPT. "Hasn't been verified with Harvey" → install the supported Codex version named in the message. "Isolation could not be verified" → a Codex config layer outside your `~/.codex` (for example a managed or `/etc/codex` config) forces a tool, hook, MCP server, instructions or custom endpoint back on; Harvey refuses to send prompts until it's gone. Model catalog errors → choose an available model ID from the catalog shown in the message, or leave `brain.model` blank to select a listed model. Harvey never switches to Claude on its own.
 
@@ -498,7 +689,7 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
 
-**Emails land in spam** — Almost always the domain, not the copy. Check SPF/DKIM/DMARC, confirm warmup ran, halve your volume.
+**Emails land in spam** — Almost always the domain, not the copy. Check SPF/DKIM/DMARC, confirm warmup ran ([TrulyInbox](https://trulyinbox.com/?via=harvey) shows the inbox rate; `harvey warmup` reads it once connected), halve your volume.
 
 **Harvey does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table logs every decision.
 
@@ -514,12 +705,14 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 harvey/
 ├── main.py              # heartbeat loop
 ├── brain.py             # Claude/Codex provider selection + skills + usage
+├── claude_runtime.py    # Isolated Claude CLI calls (safe mode, no tools, clean dir)
 ├── codex.py             # Isolated Codex subscription runtime
 ├── state.py             # SQLite schema, migrations, observations, cohorts
 ├── signals.py           # the 23-signal catalog Harvey proposes
 ├── pipeline.py          # DISCOVER → PROFILE chaining
 ├── gate.py              # deterministic pre-send checks
 ├── dashboard.py         # FastAPI JSON API
+├── dashboard_auth.py    # dashboard token, Host/Origin checks
 ├── collectors/
 │   ├── discover.py      # provider adapters, junk filtering, entity resolution
 │   └── profile.py       # the free HTTP profiler
@@ -569,6 +762,8 @@ See [CHANGELOG.md](CHANGELOG.md). Current release: **0.2.1**.
 ## License
 
 MIT
+
+TrulyInbox links in this project are affiliate links: the maintainer may earn a commission, at no extra cost to you.
 
 ---
 

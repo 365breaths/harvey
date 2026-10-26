@@ -18,12 +18,17 @@ from harvey.state import StateManager
 
 @pytest.fixture
 def client(monkeypatch):
-    """A dashboard bound to a throwaway database."""
+    """A dashboard bound to a throwaway database, used the way its own UI
+    uses it: same origin, with the token (tests/test_dashboard_auth.py covers
+    everyone else)."""
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "harvey.db"
         monkeypatch.setattr(dash, "DB_PATH", db)
         monkeypatch.setattr(dash, "WEB_DIR", Path(__file__).resolve().parent.parent / "harvey" / "web")
-        with TestClient(dash.app) as c:
+        dash.token_store.configure(Path(tmp) / "data" / "dashboard-token")
+        token = dash.token_store.get()
+        with TestClient(dash.app, base_url="http://127.0.0.1:5555",
+                        headers={"Authorization": f"Bearer {token}"}) as c:
             c.db_path = db
             yield c
 
@@ -143,6 +148,63 @@ def test_cohort_is_a_set_intersection(client):
     assert excluded["companies"][0]["name"] == "Alpha Roofing"
 
 
+async def _seed_large_cohort(db_path, n):
+    state = StateManager(str(db_path))
+    await state.init_db()
+    from harvey.signals import seed_signal_catalog
+    await seed_signal_catalog(state)
+    from harvey.models import Company
+
+    ids = [await state.add_company(Company(name=f"Co {i:03d}", domain=f"co{i:03d}.com"))
+           for i in range(n)]
+    await state.add_observations([
+        {"company_id": cid, "signal_code": "RUNNING_GOOGLE_ADS", "value_num": 1}
+        for cid in ids
+    ])
+
+
+def test_cohort_pages_through_every_match(client):
+    """Past the first page used to be unreachable: 147 matches showed 50."""
+    import asyncio
+    asyncio.run(_seed_large_cohort(client.db_path, 120))
+
+    seen = []
+    for offset in (0, 50, 100):
+        page = client.post("/api/cohort", json={
+            "require": ["RUNNING_GOOGLE_ADS"], "offset": offset, "limit": 50}).json()
+        assert page["size"] == 120
+        assert page["offset"] == offset
+        seen += [c["name"] for c in page["companies"]]
+
+    assert len(seen) == 120
+    assert len(set(seen)) == 120, "pages must not overlap"
+    assert seen == sorted(seen), "pages are in a stable order"
+
+
+def test_cohort_page_size_is_capped(client):
+    import asyncio
+    asyncio.run(_seed_large_cohort(client.db_path, 3))
+    page = client.post("/api/cohort", json={
+        "require": ["RUNNING_GOOGLE_ADS"], "limit": 100000}).json()
+    assert page["limit"] == dash.COHORT_MAX_PAGE_SIZE
+
+
+def test_cohort_csv_exports_the_whole_cohort(client):
+    import asyncio
+    asyncio.run(_seed_large_cohort(client.db_path, 120))
+    r = client.get("/api/cohort.csv", params={"require": "RUNNING_GOOGLE_ADS"})
+    assert r.status_code == 200
+    assert "text/csv" in r.headers["content-type"]
+    lines = r.text.strip().splitlines()
+    assert lines[0] == "name,domain,website,industry,location"
+    assert len(lines) == 121  # header + every match, not one page
+
+
+def test_cohort_csv_with_no_requirements_is_header_only(client):
+    r = client.get("/api/cohort.csv")
+    assert r.text.strip() == "name,domain,website,industry,location"
+
+
 def test_cohort_with_no_requirements_is_empty_not_everything(client):
     """An empty cohort must never mean 'select all' — that would silently
     turn a mis-click into a campaign against the entire database."""
@@ -234,7 +296,7 @@ def test_cost_notes_are_machine_classifiable():
     chip both key off the cost note. A signal that costs credits must not
     read as free — that is how someone accidentally turns on paid collection.
     """
-    paid = {"SERP_RANK", "EMAIL_STATUS", "EMAIL_PATTERN", "FOUND_IN_SERP"}
+    paid = {"SERP_RANK", "MAPS_RANK", "EMAIL_STATUS", "EMAIL_PATTERN", "FOUND_IN_SERP"}
     for sig in SIGNAL_CATALOG:
         free = sig["cost_note"].lower().startswith(("free", "included"))
         if sig["code"] in paid:
@@ -253,3 +315,239 @@ def test_every_signal_has_a_category_the_ui_renders():
         assert sig["category"] in CATEGORY_ORDER, (
             f"{sig['code']} is in category {sig['category']!r}, which the "
             "dashboard would silently drop")
+
+
+@pytest.mark.parametrize('body', [[], None, {'require': [7]}, {'require': {}},
+    {'offset': 'bad'}, {'offset': 1.5}, {'limit': True}, {'offset': 2**64},
+    {'require': ['x'] * 201 + ['y' * 129]}])
+def test_cohort_invalid_inputs_are_client_errors(client, body):
+    response = client.post('/api/cohort', json=body) if body is not None else client.post(
+        '/api/cohort', content='null', headers={'Content-Type': 'application/json'})
+    assert response.status_code == 400
+
+
+def test_cohort_boundaries_and_duplicate_codes(client):
+    import asyncio
+    asyncio.run(_seed_large_cohort(client.db_path, 3))
+    response = client.post('/api/cohort', json={
+        'require': ['RUNNING_GOOGLE_ADS', 'RUNNING_GOOGLE_ADS'], 'offset': -1, 'limit': 0})
+    assert response.status_code == 200
+    assert response.json()['size'] == 3
+    assert response.json()['offset'] == 0
+    assert response.json()['limit'] == 1
+    assert len(response.json()['companies']) == 1
+    assert client.post('/api/cohort', json={
+        'require': ['RUNNING_GOOGLE_ADS'], 'offset': 4}).json()['companies'] == []
+
+
+def test_cohort_over_previous_cap_and_stable_ties(client):
+    import asyncio
+    import csv
+    import io
+    import sqlite3
+    from contextlib import closing
+    async def initialize():
+        state = StateManager(str(client.db_path))
+        await state.init_db()
+        from harvey.signals import seed_signal_catalog
+        await seed_signal_catalog(state)
+    asyncio.run(initialize())
+    # Bulk seed rather than opening 10,001 individual connections.
+    with closing(sqlite3.connect(client.db_path)) as db, db:
+        db.executemany('INSERT INTO companies (id, name) VALUES (?, ?)',
+                       [(f'{i:05}', 'Same') for i in range(10001)])
+        db.executemany('INSERT INTO observations (id, company_id, signal_code, value_num) '
+                       'VALUES (?, ?, ?, 1)',
+                       [(f'obs{i}', f'{i:05}', 'RUNNING_GOOGLE_ADS') for i in range(10001)])
+    page = client.post('/api/cohort', json={
+        'require': ['RUNNING_GOOGLE_ADS'], 'offset': 9999, 'limit': 2}).json()
+    assert page['size'] == 10001
+    assert [row['id'] for row in page['companies']] == ['09999', '10000']
+    response = client.get('/api/cohort.csv', params={'require': 'RUNNING_GOOGLE_ADS'})
+    assert response.status_code == 200
+    assert len(list(csv.reader(io.StringIO(response.text)))) == 10002
+
+
+def test_cohort_csv_failure_is_not_success(client, monkeypatch):
+    async def fail(*args, **kwargs):
+        raise RuntimeError('database unavailable')
+    monkeypatch.setattr(dash, '_cohort_companies', fail)
+    response = client.get('/api/cohort.csv', params={'require': 'RUNNING_GOOGLE_ADS'})
+    assert response.status_code == 500
+    assert 'text/csv' not in response.headers['content-type']
+    assert client.get('/api/cohort.csv').status_code == 200
+    assert client.post('/api/cohort', json={'require': ['RUNNING_GOOGLE_ADS']}).status_code == 500
+
+
+def test_cohort_csv_preserves_text_and_neutralizes_formulas(client, monkeypatch):
+    import csv
+    import io
+    async def rows(*args, **kwargs):
+        return 1, [dict(name=' =HYPERLINK("evil")', domain='é, "quoted"',
+                        website='\t=1+1', industry='@SUM(1)', location='line\nnext')]
+    monkeypatch.setattr(dash, '_cohort_companies', rows)
+    response = client.get('/api/cohort.csv', params={'require': 'RUNNING_GOOGLE_ADS'})
+    cells = list(csv.reader(io.StringIO(response.text)))[1]
+    assert cells == ['\' =HYPERLINK("evil")', 'é, "quoted"', "'\t=1+1", "'@SUM(1)", 'line\nnext']
+
+
+def test_cohort_csv_requires_authorization(client):
+    response = client.get('/api/cohort.csv', headers={'Authorization': ''})
+    assert response.status_code == 401
+
+
+def test_cohort_browser_export_uses_auth_and_handles_failures():
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node unavailable')
+    web = Path(__file__).resolve().parent.parent / 'harvey' / 'web'
+    script = r'''
+const fs = require('fs'), vm = require('vm');
+const calls = [], revoked = [], links = [];
+global.window = {location: {origin: 'http://127.0.0.1:5555', hash: ''}};
+global.sessionStorage = {getItem: () => 'T'.repeat(43)};
+global.document = {body: {appendChild: x => links.push(x)}, createElement: () =>
+  ({click() {this.clicked = true;}, remove() {this.removed = true;}})};
+global.setTimeout = fn => fn();
+const locks = [];
+global.showLock = reason => locks.push(reason);
+global.hideLock = () => {};
+URL.createObjectURL = () => 'blob:local';
+URL.revokeObjectURL = url => revoked.push(url);
+let ok = true, status = 200;
+global.fetch = async (url, opts) => {calls.push({url, auth: opts.headers.get('Authorization'),
+  redirect: opts.redirect}); return {ok, status, blob: async () => ({})};};
+vm.runInThisContext(fs.readFileSync(process.argv[1], 'utf8'));
+const app = fs.readFileSync(process.argv[2], 'utf8');
+vm.runInThisContext('let _locked = false;' + app.slice(app.indexOf('async function lockIfRefused('), app.indexOf('function showLock(')));
+vm.runInThisContext("const _cohort = {require: new Set(['A']), exclude: new Set(['B'])};" +
+ app.slice(app.indexOf('async function exportCohort('), app.indexOf('function pageCohort(')));
+(async () => {
+ const button = {};
+ await exportCohort(button);
+ const success = {...button};
+ ok = false; status = 500;
+ await exportCohort(button);
+ const failure = {...button};
+ status = 401;
+ await exportCohort(button);
+ console.log(JSON.stringify({calls, revoked, links, success, failure, locks, refused: button}));
+})().catch(e => {console.error(e); process.exit(1);});
+'''
+    result = subprocess.run([node, '-e', script, str(web / 'auth.js'), str(web / 'app.js')],
+                            text=True, encoding="utf-8", capture_output=True, check=True)
+    data = json.loads(result.stdout)
+    assert all(c['auth'] == 'Bearer ' + 'T' * 43 and c['redirect'] == 'error' for c in data['calls'])
+    assert data['calls'][0]['url'] == 'http://127.0.0.1:5555/api/cohort.csv?require=A&exclude=B'
+    assert len(data['links']) == 1
+    assert data['links'][0]['clicked'] and data['links'][0]['removed']
+    assert data['revoked'] == ['blob:local']
+    assert data['success'] == {'disabled': False, 'textContent': 'Export CSV'}
+    assert data['failure'] == {'disabled': False, 'textContent': 'Export failed — retry'}
+    assert data['refused'] == data['failure']
+    assert len(data['locks']) == 1 and 'saved token was not accepted' in data['locks'][0]
+
+
+def test_cohort_csv_invalid_codes_are_client_error(client):
+    response = client.get('/api/cohort.csv', params={'require': 'x' * 129})
+    assert response.status_code == 400
+    response = client.get('/api/cohort.csv', params={'exclude': 'x' * 129})
+    assert response.status_code == 400
+
+
+def test_cohort_browser_ignores_superseded_pages_and_cleared_filters():
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node unavailable')
+    app = Path(__file__).resolve().parent.parent / 'harvey' / 'web' / 'app.js'
+    script = r'''
+const fs = require('fs'), vm = require('vm');
+const app = fs.readFileSync(process.argv[1], 'utf8');
+const el = {innerHTML: 'previous export button'}, pending = [];
+global.document = {getElementById: () => el};
+global.api = (path, opts) => new Promise(resolve => pending.push({resolve, body: JSON.parse(opts.body)}));
+global.escHtml = s => s || '';
+vm.runInThisContext("const _cohort = {require: new Set(['A']), exclude: new Set()};" +
+ "let _cohortOffset = 0, _cohortGeneration = 0; const COHORT_PAGE = 50;" +
+ app.slice(app.indexOf('async function runCohort('), app.indexOf('async function exportCohort(')));
+const page = (name, offset) => ({size: 100, offset, companies: [{name}]});
+(async () => {
+ const first = runCohort();
+ const loading = el.innerHTML;
+ vm.runInThisContext('_cohortOffset = 50');
+ const second = runCohort();
+ pending[1].resolve(page('LATEST', 50)); await second;
+ const latest = el.innerHTML;
+ pending[0].resolve(page('STALE', 0)); await first;
+ const afterOld = el.innerHTML;
+ const third = runCohort();
+ vm.runInThisContext('_cohort.require.clear()');
+ await runCohort();
+ const cleared = el.innerHTML;
+ pending[2].resolve(page('STALE_AFTER_CLEAR', 50)); await third;
+ console.log(JSON.stringify({loading, latest, afterOld, cleared, afterClear: el.innerHTML,
+   offsets: pending.map(x => x.body.offset)}));
+})().catch(e => {console.error(e); process.exit(1);});
+'''
+    response = subprocess.run([node, '-e', script, str(app)], text=True, encoding="utf-8",
+                              capture_output=True, check=True)
+    data = json.loads(response.stdout)
+    assert data['offsets'] == [0, 50, 50]
+    assert 'Loading cohort' in data['loading'] and 'Export CSV' not in data['loading']
+    assert 'LATEST' in data['latest'] and 'STALE' not in data['latest']
+    assert data['afterOld'] == data['latest']
+    assert data['cleared'] == data['afterClear'] == ''
+
+
+# ── Cohort ranges: "organic rank 11-30" ──
+
+
+async def _seed_ranks(db_path):
+    state = StateManager(str(db_path))
+    await state.init_db()
+    from harvey.signals import seed_signal_catalog
+    await seed_signal_catalog(state)
+    from harvey.models import Company
+    for name, rank in (("Top", 3), ("Mid", 14), ("Deep", 45)):
+        cid = await state.add_company(Company(name=name, domain=f"{name.lower()}.com"))
+        await state.add_observation("SERP_RANK", company_id=cid, collector="discover",
+                                    value_num=rank, value_text="roofer Denver")
+
+
+def test_cohort_range_filter_api(client):
+    import asyncio
+    asyncio.run(_seed_ranks(client.db_path))
+    data = client.post("/api/cohort", json={
+        "ranges": [{"code": "SERP_RANK", "min": 11, "max": 30}]}).json()
+    assert data["size"] == 1 and data["companies"][0]["name"] == "Mid"
+    # A range alone is a cohort; nothing at all is still empty.
+    assert client.post("/api/cohort", json={}).json()["size"] == 0
+
+    r = client.get("/api/cohort.csv", params={"ranges": "SERP_RANK:11:30"})
+    assert r.status_code == 200
+    assert [line.split(",")[0] for line in r.text.strip().splitlines()[1:]] == ["Mid"]
+    r = client.get("/api/cohort.csv", params={"ranges": "SERP_RANK::10"})
+    assert [line.split(",")[0] for line in r.text.strip().splitlines()[1:]] == ["Top"]
+
+
+@pytest.mark.parametrize("ranges", [
+    "SERP_RANK", [{"code": "SERP_RANK", "min": "x"}], [{"min": 1}],
+    [{"code": "SERP_RANK"}], [{"code": "SERP_RANK", "min": 30, "max": 11}],
+    [{"code": "SERP_RANK", "min": True}], [{"code": "S" * 129, "min": 1}],
+    [{"code": "SERP_RANK", "min": 1}] * 21,
+])
+def test_cohort_invalid_ranges_are_client_errors(client, ranges):
+    response = client.post("/api/cohort", json={"ranges": ranges})
+    assert response.status_code == 400
+
+
+def test_signals_api_marks_numeric_signals_for_the_range_ui(client):
+    data = client.get("/api/signals").json()
+    sigs = {s["code"]: s for g in data["groups"] for s in g["signals"]}
+    assert sigs["SERP_RANK"]["value_type"] == "num"

@@ -23,16 +23,48 @@ SIGNAL_CATALOG: list[dict] = [
         "code": "SERP_RANK",
         "label": "Search rank position",
         "description": (
-            "Where the business ranks for its core '<service> <city>' search. "
-            "The most useful prospecting signal there is: positions 11-30 are "
-            "the sweet spot — visible enough to be trying, not winning yet. "
-            "Top 10 are already winning (harder sell); 31+ are cheaper but "
-            "less motivated."
+            "Where the business ranks organically for a '<service> <city>' "
+            "search (the search phrase is stored with it). The most useful "
+            "prospecting signal there is: positions 11-30 are the sweet spot — "
+            "visible enough to be trying, not winning yet. Top 10 are already "
+            "winning (harder sell); 31+ are cheaper but less motivated. Rank "
+            "depends on where the searcher stands: this is the view from the "
+            "city centre."
         ),
         "category": "discovery",
         "value_type": "num",
         "collector": "discover",
-        "cost_note": "~$0.0006 per search (paid SERP API, queued endpoint)",
+        "cost_note": "~$0.006 per search at depth 30 (paid SERP API, Live endpoint)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "IN_LOCAL_PACK",
+        "label": "In the Google local 3-pack",
+        "description": (
+            "Holds one of the three map slots above the organic results for a "
+            "'<service> <city>' search (value = slot 1-3; ads excluded). These "
+            "businesses are already winning local search — exclude them to "
+            "find the ones who aren't, or target them with something else."
+        ),
+        "category": "discovery",
+        "value_type": "num",
+        "collector": "discover",
+        "cost_note": "included in the organic rank search above",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "MAPS_RANK",
+        "label": "Google Maps rank position",
+        "description": (
+            "Where the business appears in Google Maps for a '<service> <city>' "
+            "search from the city centre (the search phrase is stored with it). "
+            "Outside the top 3 on the map means outside the local pack most "
+            "searchers see. Also finds businesses with no website at all."
+        ),
+        "category": "discovery",
+        "value_type": "num",
+        "collector": "discover",
+        "cost_note": "~$0.002 per Maps search of up to 100 results (paid SERP API)",
         "confidence_floor": 0.0,
     },
     {
@@ -200,13 +232,69 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
     {
+        "code": "YC_BACKED",
+        "label": "Backed by Y Combinator",
+        "description": ("The company says on its own site that it's YC-backed (a batch like "
+                        "W24, a YC badge, or a link to its YC page). Pairs with the YC-startups "
+                        "discovery preset and the startup-founder writing playbook."),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "profile",
+        "cost_note": "free (homepage HTML)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "ACCELERATOR",
+        "label": "Went through an accelerator",
+        "description": ("The company says on its own site that an accelerator backed it: Techstars, "
+                        "500 Global, Antler, Entrepreneur First, South Park Commons, Neo, AI Grant, "
+                        "a16z speedrun, Pioneer or Plug and Play, with the cohort when stated. YC is "
+                        "YC_BACKED. Pairs with the accelerator discovery preset and the startup-founder "
+                        "writing playbook."),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "profile",
+        "cost_note": "free (homepage and About page)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "FUNDING_ROUND",
+        "label": "Announced a funding round",
+        "description": ("The company announces its own raise on its site (\"we raised\", \"Acme raises "
+                        "$12M Series A\"): round, amount and date when stated. Raises over 18 months old "
+                        "aren't written to as news. Pairs with the recently-funded discovery preset."),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "profile",
+        "cost_note": "free (homepage, About, press page)",
+        "confidence_floor": 0.0,
+    },
+    {
         "code": "HIRING_ROLE",
         "label": "Hiring for a relevant role",
-        "description": "An open role on their careers page that implies they're buying in your category right now.",
+        "description": (
+            "An open role that implies they're buying in your category right now: one "
+            "of your hiring_signals roles (or ICP titles) on the Greenhouse, Lever, "
+            "Ashby or Workable board their site links to, with department, location "
+            "and posting date, or a role listed on their careers page."
+        ),
         "category": "profile",
         "value_type": "text",
         "collector": "profile",
-        "cost_note": "free (careers page)",
+        "cost_note": "free (careers page or public job-board feed)",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "OPEN_ROLES",
+        "label": "Open roles on their job board",
+        "description": (
+            "How many roles are open on the Greenhouse, Lever, Ashby or Workable board "
+            "their site links to. A growing team is a budget signal; zero is a quiet one."
+        ),
+        "category": "profile",
+        "value_type": "num",
+        "collector": "profile",
+        "cost_note": "free (public job-board feed, one request)",
         "confidence_floor": 0.0,
     },
 
@@ -248,11 +336,16 @@ SIGNAL_CATALOG: list[dict] = [
     {
         "code": "LIKELY_OWNER",
         "label": "Likely the owner",
-        "description": "Registry indicators suggest this person owns the business rather than working there.",
+        "description": (
+            "The company's own website says this person owns or founded it: an "
+            "Owner/Founder/President title, a sentence like 'owned and operated by' "
+            "or a schema.org founder. Former, retired and late owners don't count. "
+            "The evidence is kept with the fact."
+        ),
         "category": "people",
         "value_type": "bool",
         "collector": "people",
-        "cost_note": "free (public registry API)",
+        "cost_note": "free (company website)",
         "confidence_floor": 0.0,
     },
 

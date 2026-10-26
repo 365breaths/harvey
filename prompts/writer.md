@@ -32,6 +32,18 @@ STRICT EMAIL RULES — FOLLOW EVERY SINGLE ONE:
 16. NEVER use "no pressure", "no obligation", "no contracts" in email 1.
 17. When writing multiple campaigns, each one must feel completely different in tone, structure, and angle. Not just different pain points in the same format.
 
+SOUNDS-HUMAN CHECKS — the patterns that still give AI away after the rules above. Before returning, reread every email and rewrite any sentence that does one of these:
+- "Not X, but Y" contrasts, including split across two sentences ("It's not about X. It's about Y.") or "less X, more Y". Just state Y.
+- One-line dramatic closers or fragments ("That's the gap." "Every call counts."). End on the question instead.
+- Sayings that sound deep but say nothing ("Busy is a good problem until it isn't").
+- A staged run-up before the point ("Here's the thing:", "The truth is", "Funny enough"). Start with the point.
+- Forced groups of three ("calls, chats, and bookings") when one or two would do.
+- Stacked qualifiers ("really just pretty much") and hyphenated buzz-pairs ("always-on, done-for-you").
+- Inflated significance or sales language ("transform your business", "a whole new level", "crucial", "powerful", "robust", "effortless").
+- Shallow -ing riders tacked onto a sentence ("..., helping you grow"). Cut them.
+- Curly quotes or fancy punctuation. Straight quotes only.
+- Every sentence the same length. Mix short sentences with longer ones, the way people write when they type fast.
+
 SPAM FILTER RULES — these words and patterns get emails junked. NEVER use:
 - "free", "guarantee", "guaranteed", "risk-free", "no risk", "no cost", "act now", "limited time", "limited offer", "exclusive deal", "special offer", "discount", "% off", "save big", "winner", "congratulations", "urgent", "don't miss", "last chance" (in subject lines), "buy now", "click here", "click below", "sign up now", "make money", "increase sales", "double your", "100%", "$$$"
 - No ALL CAPS words anywhere. No more than one question mark per email.

@@ -23,11 +23,97 @@ from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep 
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
 from harvey.paths import PROJECT_ROOT
+from harvey.startups import parse_funding
 
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 
 # How long (seconds) a connection waits on a locked database before failing.
 BUSY_TIMEOUT_SECONDS = 30.0
+
+# Email statuses the Writer drafts for. Shared with the heartbeat so it only
+# chooses write_campaign when there is something the Writer will act on.
+WRITABLE_EMAIL_STATUSES = ("verified", "risky")
+# Settings key, per prospect: the user emailed them by hand from the
+# dashboard. Its value is the status they had before, so undo is exact; its
+# presence tells the Sender never to email them as well.
+MANUAL_SEND_KEY = "manual_send:"
+# Outbox cancel reason for mail the user sent by hand instead; undo restores it.
+HAND_SENT_REASON = "sent_by_hand"
+# Set when you undo someone's opt-out: Harvey's first reply to them after
+# that waits for your approval, even on autopilot. Cleared once it has.
+REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
+# Outbox error prefix for an email autopilot held for a human (gate.
+# autopilot_review): approve-all skips these, they're approved one by one.
+HELD_FOR_REVIEW = "held for your review: "
+# Set while the heartbeat holds sending because replies couldn't all be read
+# (JSON: since, last_seen, reason), so Today and `harvey status` can say so.
+SENDS_HELD_KEY = "sends_held"
+# Outbox error on a sequence email cancelled because someone else at the
+# company replied: one answer from a company stops the cold email to all of it.
+COLLEAGUE_REPLIED = "a colleague replied"
+# Setting set (to their name) when someone's reply stops their company.
+# An out-of-office or a "wrong person" doesn't set it.
+COMPANY_STOP_KEY = "company_stop:"
+# Shared mailbox providers: two people on one aren't colleagues.
+FREE_MAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com",
+    "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com",
+    "mac.com", "proton.me", "protonmail.com", "gmx.com", "gmx.de", "web.de",
+    "mail.com", "zoho.com", "yandex.com", "yandex.ru", "qq.com", "163.com",
+    "comcast.net", "att.net", "verizon.net", "sbcglobal.net", "bellsouth.net",
+    "cox.net", "charter.net", "hey.com", "fastmail.com", "pm.me", "rr.com",
+    "earthlink.net", "frontier.com", "frontiernet.net", "windstream.net",
+    "centurylink.net", "optonline.net", "roadrunner.com", "juno.com",
+    "netzero.net", "mindspring.com", "embarqmail.com", "suddenlink.net",
+    "yahoo.co.uk", "yahoo.ca", "yahoo.com.au", "hotmail.co.uk", "hotmail.ca",
+    "live.co.uk", "live.ca", "btinternet.com", "sky.com", "virginmedia.com",
+    "talktalk.net", "ntlworld.com", "shaw.ca", "rogers.com", "sympatico.ca",
+    "telus.net", "bigpond.com", "optusnet.com.au", "orange.fr", "free.fr",
+    "wanadoo.fr", "laposte.net", "t-online.de", "libero.it", "mail.ru",
+    "naver.com", "seznam.cz", "wp.pl", "o2.pl", "tutanota.com", "tuta.io",
+})
+
+
+def _email_domain(alias: str) -> str:
+    return f"lower(substr({alias}.email, instr({alias}.email, '@') + 1))"
+
+
+def _colleagues(p: str, c: str) -> str:
+    """SQL: prospect ``c`` works with prospect ``p``. The same company; or,
+    when either has no company, the same email domain, never a shared one
+    and never one that isn't the known side's own company domain."""
+    domain = _email_domain(p)
+    free = ", ".join(f"'{d}'" for d in sorted(FREE_MAIL_DOMAINS))
+    own = ("(SELECT lower(co.domain) FROM companies co WHERE co.id = {x}.company_id)")
+    return (
+        f"{c}.id != {p}.id AND ("
+        f"({p}.company_id != '' AND {c}.company_id = {p}.company_id) OR "
+        f"(({p}.company_id = '' OR {c}.company_id = '') "
+        f"AND instr({p}.email, '@') > 0 AND {domain} != '' AND {domain} NOT IN ({free}) "
+        f"AND {_email_domain(c)} = {domain} "
+        f"AND ({p}.company_id = '' OR {domain} = {own.format(x=p)}) "
+        f"AND ({c}.company_id = '' OR {domain} = {own.format(x=c)})))"
+    )
+
+
+def _company_answered(p: str) -> str:
+    """SQL: someone at prospect ``p``'s company has replied."""
+    return (f"EXISTS (SELECT 1 FROM prospects c, settings s "
+            f"WHERE s.key = '{COMPANY_STOP_KEY}' || c.id AND {_colleagues(p, 'c')})")
+# Outbox error on what autopilot had approved when it was turned off.
+AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
+# Outbox errors starting with this: the send was cut off and the email may
+# have reached them. Never retried, and counted as Harvey's mail, so the
+# dashboard never offers a second one by hand.
+MAYBE_SENT_PREFIX = "may have gone out: "
+STALE_SENDING_ERROR = (
+    MAYBE_SENT_PREFIX + "Harvey stopped in the middle of sending it; check "
+    "your Sent folder before emailing them again"
+)
+# A claimed email still not finished after this long was cut off mid-send (a
+# send itself takes seconds, and a whole cycle is stopped after 10 minutes).
+# Long enough never to catch another sender's email in flight.
+STALE_SENDING_AFTER = timedelta(minutes=15)
 
 
 def _new_id() -> str:
@@ -413,7 +499,23 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
-    # ── v12: send-attempt log, suppression list, retry bookkeeping ──
+    # ── v12: look actions up by type (opt-out history, undone opt-outs) ──
+    """
+    CREATE INDEX IF NOT EXISTS idx_actions_type_created ON actions(action_type, created_at);
+    """,
+    # ── v13: who approved an outbox row: 'you' (a human), 'autopilot',
+    # 'earlier' (approved before this was recorded), '' (not approved) ──
+    """
+    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
+    UPDATE outbox SET approved_by = 'earlier' WHERE status IN ('approved', 'sending');
+    """,
+    # ── v14: each recipient's time zone, for the send window ──
+    """
+    -- An IANA name such as 'Europe/Oslo', worked out once from what Harvey
+    -- knows about the recipient. Empty until then.
+    ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
+    """,
+    # ── v15: send-attempt log, suppression list, retry bookkeeping ──
     """
     -- One row per call to the mail server, never overwritten: what was
     -- tried, when, and exactly what the server answered. "accepted" means
@@ -688,6 +790,7 @@ class StateManager:
         d["email_verified"] = bool(d.get("email_verified", 0))
         d["phone_verified"] = bool(d.get("phone_verified", 0))
         d["email_status"] = d.get("email_status") or ""
+        d["timezone"] = d.get("timezone") or ""
         return Prospect(**d)
 
     async def add_prospect(self, prospect: Prospect) -> str:
@@ -760,13 +863,87 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return [self._prospect_from_row(r) for r in rows]
 
-    async def update_prospect_status(self, prospect_id: str, status: str):
+    async def set_prospect_timezone(self, prospect_id: str, zone: str):
+        """Remember a recipient's time zone. Leaves updated_at alone: it
+        isn't a change anyone made to the prospect."""
         async with self._connect() as db:
             await db.execute(
-                "UPDATE prospects SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE prospects SET timezone = ? WHERE id = ?", (zone, prospect_id)
+            )
+            await db.commit()
+
+    async def update_prospect_status(self, prospect_id: str, status: str):
+        # An opt-out is permanent: nothing Harvey does later (a reply, a
+        # send, a retry) may move someone off it and back into outreach.
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE prospects SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IS NOT 'opted_out'",
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
+
+    async def undo_opt_out(self, prospect_id: str, details: dict | None = None) -> bool:
+        """A human's undo of an opt-out: the one way off 'opted_out'.
+
+        They go to 'replied', not back into the sequence: Harvey sends
+        nothing new on its own (the sender never stages 'replied'), and what
+        the opt-out cancelled stays cancelled. Harvey's first reply to them
+        after this waits for approval even on autopilot (REVIEW_NEXT_REPLY_KEY).
+        The status, that flag and the opt_out_undone log entry are one write.
+        False, and nothing written, when they weren't opted out."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'replied', updated_at = ? "
+                "WHERE id = ? AND status = 'opted_out'",
+                (_utcnow().isoformat(), prospect_id),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, '1', CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                (REVIEW_NEXT_REPLY_KEY + prospect_id,),
+            )
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "opt_out_undone", "dashboard",
+                 json.dumps({"prospect_id": prospect_id, **(details or {})})),
+            )
+            await db.commit()
+            return True
+
+    async def opt_out_history(self, prospect_id: str) -> list[dict]:
+        """Every opt-out and undo recorded for this person, oldest first."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT action_type, details_json, created_at FROM actions "
+                "WHERE action_type IN ('opt_out', 'opt_out_undone') "
+                "AND json_valid(details_json) "
+                "AND json_extract(details_json, '$.prospect_id') = ? "
+                "ORDER BY created_at, rowid",
+                (prospect_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [{**json.loads(d), "action": a, "at": str(at or "")} for a, d, at in rows]
+
+    async def queue_prospect_if_unsent(self, prospect_id: str) -> bool:
+        """Mark a prospect 'queued' unless something moved them on meanwhile.
+
+        Conditional, so a status set while a campaign was being staged (the
+        user marking them sent by hand, a reply) is never overwritten.
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'queued', updated_at = ? "
+                "WHERE id = ? AND status IN ('new', 'queued')",
+                (_utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
 
     async def get_prospect_by_email(self, email: str) -> Prospect | None:
         """Look up a prospect by email address (indexed, case-insensitive)."""
@@ -870,9 +1047,11 @@ class StateManager:
         provider: str = "",
         thread_ref: str = "",
         in_reply_to: str = "",
+        approved_by: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard."""
+        (campaign, prospect, step) slot already exists — the double-send guard.
+        ``approved_by="autopilot"`` when it's queued approved on autopilot."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -887,6 +1066,8 @@ class StateManager:
                     status, send_at, provider, thread_ref, in_reply_to,
                 ),
             )
+            if cursor.rowcount > 0 and approved_by:
+                await db.execute("UPDATE outbox SET approved_by = ? WHERE id = ?", (approved_by, item_id))
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
 
@@ -896,8 +1077,16 @@ class StateManager:
         due_before: str | None = None,
         limit: int = 200,
         exclude_kind: str | None = None,
+        skip_unready_follow_ups: bool = False,
+        kind: str | None = None,
     ) -> list[dict]:
+        """skip_unready_follow_ups: leave out sequence follow-ups whose
+        previous step hasn't gone out yet, so they can't fill the page.
+        kind: only that kind ("sequence" for cold email)."""
         where, params = [], []
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
         if status:
             where.append("status = ?")
             params.append(status)
@@ -907,7 +1096,14 @@ class StateManager:
         if exclude_kind:
             where.append("(kind IS NULL OR kind != ?)")
             params.append(exclude_kind)
-        sql = "SELECT * FROM outbox"
+        if skip_unready_follow_ups:
+            where.append(
+                "NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS ("
+                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
+                "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
+                "AND p.step = o.step - 1 "
+                "AND p.status IN ('pending_review', 'approved', 'sending')))")
+        sql = "SELECT * FROM outbox o"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY send_at ASC, created_at ASC LIMIT ?"
@@ -916,6 +1112,50 @@ class StateManager:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_texts_for_prospect(self, prospect_id: str, limit: int = 50) -> list[str]:
+        """Everything Harvey wrote for this person, which a reply may quote
+        back: their Outbox emails (a sent one with its footer, whatever it
+        said then) and the templates of campaigns they're in (Instantly and
+        hand sends never pass through the Outbox; merge tags unfilled)."""
+        texts: list[str] = []
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT body FROM outbox WHERE prospect_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (prospect_id, int(limit)),
+            ) as cursor:
+                texts += [r[0] or "" for r in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT sequence_json, prospect_ids_json FROM campaigns "
+                "WHERE prospect_ids_json LIKE ? ORDER BY created_at DESC LIMIT ?",
+                ("%" + prospect_id + "%", int(limit)),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        for sequence_json, ids_json in rows:
+            try:
+                if prospect_id not in json.loads(ids_json or "[]"):
+                    continue
+                texts += [str(step.get("body") or "") for step in json.loads(sequence_json or "[]")
+                          if isinstance(step, dict)]
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return texts
+
+    async def count_due_cold_outbox(self, due_before: str) -> int:
+        """Approved cold email due by ``due_before``, leaving out follow-ups
+        whose previous step hasn't gone out yet (as get_outbox's
+        skip_unready_follow_ups does)."""
+        sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
+               "AND o.kind = 'sequence' AND (o.send_at IS NULL OR o.send_at <= ?) "
+               "AND NOT (o.step > 1 AND EXISTS ("
+               "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
+               "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
+               "AND p.step = o.step - 1 "
+               "AND p.status IN ('pending_review', 'approved', 'sending')))")
+        async with self._connect() as db:
+            async with db.execute(sql, (due_before,)) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
@@ -944,23 +1184,178 @@ class StateManager:
             )
             await db.commit()
 
+    async def claim_outbox_item(self, item_id: str) -> bool:
+        """Take an approved item for sending: approved → sending, atomically.
+
+        False when it is no longer approved and due (cancelled by a reply,
+        bounce or hand send, rejected, rescheduled, or taken by another
+        sender), so it must not go out now. Cancels never touch a claimed item: it is already on its way.
+        """
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'sending', updated_at = ? "
+                "WHERE id = ? AND status = 'approved' "
+                "AND (send_at IS NULL OR send_at <= ?)",
+                (now, item_id, now),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def fail_stale_sending_outbox(
+        self, older_than: timedelta = STALE_SENDING_AFTER
+    ) -> int:
+        """Items claimed long ago and never finished (Harvey stopped mid-send).
+
+        Whether they went out is unknown, so they are never retried: they
+        become failed with a note to check the Sent folder.
+        """
+        cutoff = (_utcnow() - older_than).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
+                "WHERE status = 'sending' AND datetime(updated_at) < datetime(?)",
+                (STALE_SENDING_ERROR, _utcnow().isoformat(), cutoff),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def edit_outbox_draft(self, item_id: str, subject: str, body: str) -> int:
+        """Rewrite a draft's subject and body — only while it awaits review.
+
+        Atomic on status, like approve: an item already approved, sent or
+        rejected is never changed. Editing never approves; that stays a
+        separate, explicit step. Returns the number of rows changed (0/1).
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET subject = ?, body = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'pending_review'",
+                (subject, body, _utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def restore_hand_cancelled_outbox(self, prospect_id: str, reason: str) -> int:
+        """Undo a cancel made with `reason`: those items go back for review.
+
+        Always to pending_review, even if they were approved before: a human
+        decides again. They're rescheduled from now with their original gaps,
+        so a late undo never releases a whole sequence at once. Items
+        cancelled for any other reason stay cancelled.
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, send_at FROM outbox WHERE prospect_id = ? "
+                "AND status = 'cancelled' AND error = ? ORDER BY send_at",
+                (prospect_id, reason),
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+            if not rows:
+                return 0
+            now = _utcnow()
+
+            def _at(value):
+                try:
+                    return datetime.fromisoformat(str(value))
+                except (TypeError, ValueError):
+                    return now
+            first = _at(rows[0]["send_at"])
+            for r in rows:
+                send_at = now + max(timedelta(0), _at(r["send_at"]) - first)
+                await db.execute(
+                    "UPDATE outbox SET status = 'pending_review', error = '', send_at = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (send_at.isoformat(), now.isoformat(), r["id"]),
+                )
+            await db.commit()
+            return len(rows)
+
+    async def reject_outbox_item(self, item_id: str) -> int:
+        """Reject an item still waiting to go out. Mail already on its way
+        or sent is never relabelled. Returns rows changed (0/1)."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'rejected', updated_at = ? "
+                "WHERE id = ? AND status IN ('pending_review', 'approved')",
+                (_utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def approve_outbox(self, item_id: str | None = None) -> int:
-        """Approve one pending item, or ALL pending when item_id is None."""
+        """Approve one pending item, or ALL pending when item_id is None.
+
+        A human's approval (dashboard or CLI): marked approved_by 'you', so
+        the autopilot review (gate.autopilot_review) doesn't hold it again,
+        and any reason it was held is cleared."""
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE id = ? AND status = 'pending_review'",
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE id = ? AND status = 'pending_review'",
                     (_utcnow().isoformat(), item_id),
                 )
             else:
+                # Not the ones autopilot held for a look (possible planted
+                # links or a leak): those are approved one at a time.
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE status = 'pending_review'",
-                    (_utcnow().isoformat(),),
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE status = 'pending_review' "
+                    "AND COALESCE(error, '') NOT LIKE ?",
+                    (_utcnow().isoformat(), HELD_FOR_REVIEW + "%"),
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def note_sends_held(self, reason: str):
+        """The heartbeat held sending this cycle. Keeps when it started."""
+        now = _utcnow().isoformat()
+        # A hold that went stale (Harvey stopped) doesn't date a new one.
+        since = ((await self.current_sends_held()) or {}).get("since") or now
+        await self.set_setting(SENDS_HELD_KEY, json.dumps(
+            {"since": since, "last_seen": now, "reason": str(reason)[:500]}))
+
+    async def clear_sends_held(self):
+        if await self.get_setting(SENDS_HELD_KEY):
+            await self.delete_setting(SENDS_HELD_KEY)
+
+    async def current_sends_held(self, max_age_hours: float = 12) -> dict | None:
+        """The hold, unless Harvey hasn't seen it for ``max_age_hours`` (it
+        stopped, or the hold lifted without a cycle saying so)."""
+        try:
+            hold = json.loads(await self.get_setting(SENDS_HELD_KEY) or "null")
+            seen = datetime.fromisoformat(hold["last_seen"])
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            return None
+        if _utcnow() - seen > timedelta(hours=max_age_hours):
+            return None
+        return hold
+
+    async def requeue_autopilot_approved(self) -> int:
+        """Autopilot was turned off: everything it approved that hasn't gone
+        out waits for you instead, and so does what was approved before
+        Harvey recorded who approved ('earlier'; it can't tell). Yours stays
+        approved. Returns how many."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'pending_review', approved_by = '', "
+                "error = ?, updated_at = ? WHERE status = 'approved' "
+                "AND approved_by IN ('autopilot', 'earlier')",
+                (AUTOPILOT_OFF_REASON, _utcnow().isoformat()),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def count_held_for_review(self) -> int:
+        """Emails autopilot sent back for a human, still waiting."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'pending_review' AND error LIKE ?",
+                (HELD_FOR_REVIEW + "%",),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def cancel_pending_outbox_for_prospect(
         self, prospect_id: str, reason: str = "stop_on_reply"
@@ -975,6 +1370,47 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def stop_company(self, prospect_id: str) -> int:
+        """Someone replied: mark their company as answered and cancel the
+        sequence emails queued for everyone else there. Replies Harvey owes
+        a colleague who wrote in themselves are not touched."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT first_name, last_name, email FROM prospects WHERE id = ?",
+                (prospect_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return 0
+            who = " ".join(x for x in (row["first_name"], row["last_name"]) if x) or row["email"]
+            await db.execute(
+                "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (COMPANY_STOP_KEY + prospect_id, who, _utcnow().isoformat()),
+            )
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                "WHERE kind = 'sequence' AND status IN ('pending_review', 'approved') "
+                "AND prospect_id IN (SELECT c.id FROM prospects c, prospects p "
+                f"WHERE p.id = ? AND {_colleagues('p', 'c')})",
+                (f"{COLLEAGUE_REPLIED} ({who})", _utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def colleague_who_replied(self, prospect_id: str) -> str | None:
+        """The name of someone at this prospect's company who has replied,
+        or None. A cold email to them is no longer cold: the company answered."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT s.value FROM prospects p, prospects c, settings s "
+                f"WHERE p.id = ? AND s.key = '{COMPANY_STOP_KEY}' || c.id "
+                f"AND {_colleagues('p', 'c')} LIMIT 1",
+                (prospect_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return row[0] if row else None
+
     async def count_outbox_sent(self) -> int:
         async with self._connect() as db:
             async with db.execute(
@@ -982,52 +1418,56 @@ class StateManager:
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
-    async def count_outbox_sent_today(self) -> int:
-        """Emails that left (or may have left) today. In-flight and
-        uncertain sends count too: the cap errs toward sending less."""
+    async def count_outbox_sent_today(self, kind: str | None = None,
+                                      since: str | None = None) -> int:
+        """Emails that left (or may have left) today (the UTC day, or since
+        `since`, a naive UTC ISO time); only one kind ("sequence", "reply")
+        if given. In-flight sends and ones that may have gone out count
+        too: the cap errs toward sending less."""
+        left = ("(status IN ('sent', 'sending') OR "
+                "(status = 'failed' AND error LIKE ?))")
+        params: tuple = (MAYBE_SENT_PREFIX + "%",)
+        if since:
+            sql = f"SELECT COUNT(*) FROM outbox WHERE {left} AND COALESCE(sent_at, updated_at) >= ?"
+            params += (since,)
+        else:
+            sql = (f"SELECT COUNT(*) FROM outbox WHERE {left} "
+                   "AND date(COALESCE(sent_at, updated_at)) = date('now')")
+        if kind:
+            sql += " AND kind = ?"
+            params += (kind,)
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM outbox "
-                "WHERE status IN ('sent', 'sending', 'uncertain') "
-                "AND date(COALESCE(sent_at, updated_at)) = date('now')"
-            ) as cursor:
+            async with db.execute(sql, params) as cursor:
                 return (await cursor.fetchone())[0]
 
-    async def claim_outbox_item(self, item_id: str, message_id: str = "") -> bool:
-        """approved -> sending, atomically, just before the provider call.
-        A row left in 'sending' means the outcome was never recorded (crash),
-        and it is never picked up for sending again."""
+    async def get_step_delay_days(self, campaign_id: str, step: int) -> int | None:
+        """The campaign's planned wait before `step` (days after the step
+        before it), or None when the campaign or step isn't known."""
         async with self._connect() as db:
-            if message_id:
-                cursor = await db.execute(
-                    "UPDATE outbox SET status = 'sending', message_id = ?, updated_at = ? "
-                    "WHERE id = ? AND status = 'approved'",
-                    (message_id, _utcnow().isoformat(), item_id),
-                )
-            else:
-                cursor = await db.execute(
-                    "UPDATE outbox SET status = 'sending', updated_at = ? "
-                    "WHERE id = ? AND status = 'approved'",
-                    (_utcnow().isoformat(), item_id),
-                )
-            await db.commit()
-            return cursor.rowcount > 0
+            async with db.execute(
+                "SELECT sequence_json FROM campaigns WHERE id = ?", (campaign_id or "",)
+            ) as cursor:
+                row = await cursor.fetchone()
+        try:
+            for s in json.loads((row[0] if row else None) or "[]"):
+                if isinstance(s, dict) and int(s.get("step", 0)) == int(step):
+                    return max(0, int(s.get("delay_days") or 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
 
-    async def mark_stuck_sending_uncertain(self, older_than_minutes: int = 15) -> int:
-        """Rows still 'sending' long after their attempt: Harvey stopped
-        between handing the email to the server and writing down what
-        happened. It may have gone out, so they become 'uncertain' for a
-        human to check, never retried."""
-        cutoff = (_utcnow() - timedelta(minutes=older_than_minutes)).isoformat()
+    async def get_previous_step(self, item: dict) -> dict | None:
+        """The email a sequence follow-up follows (same campaign and person,
+        one step earlier), or None."""
         async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE outbox SET status = 'uncertain', "
-                "error = 'interrupted mid-send: may or may not have been sent', "
-                "updated_at = ? WHERE status = 'sending' AND updated_at < ?",
-                (_utcnow().isoformat(), cutoff),
-            )
-            await db.commit()
-            return cursor.rowcount
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE prospect_id = ? AND campaign_id = ? "
+                "AND kind = 'sequence' AND step = ? ORDER BY created_at DESC LIMIT 1",
+                (item["prospect_id"], item.get("campaign_id") or "", int(item["step"]) - 1),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
 
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:
@@ -1273,6 +1713,52 @@ class StateManager:
             await db.commit()
         return len(payload)
 
+    async def yc_batch(self, company_id: str) -> str | None:
+        """The YC batch the company says it's in ("" when it doesn't say
+        which), or None when it isn't YC-backed or nobody checked. The
+        latest reading wins; profiling never writes "no" over a YC-preset
+        search hit, but does over its own earlier "yes"."""
+        if not company_id:
+            return None
+        rows = await self.get_observations(company_id=company_id, signal_code="YC_BACKED",
+                                           latest_only=True, limit=1)
+        if rows and rows[0].get("value_num") == 1:
+            return rows[0].get("value_text") or ""
+        return None
+
+    async def yc_search_hit(self, company_id: str) -> bool:
+        """Did a YC-preset search find this company (its latest YC reading
+        is a discovery hit)?"""
+        return await self.search_hit(company_id, "YC_BACKED")
+
+    async def search_hit(self, company_id: str, signal_code: str) -> bool:
+        """Is the company's latest reading of ``signal_code`` a preset
+        search's hit (collector "discover")? Profiling doesn't write "not
+        stated" over one."""
+        rows = await self.get_observations(company_id=company_id, signal_code=signal_code,
+                                           latest_only=True, limit=1)
+        return bool(rows and rows[0].get("collector") == "discover" and rows[0].get("value_num") == 1)
+
+    async def _latest_yes(self, company_id: str, signal_code: str) -> dict | None:
+        if not company_id:
+            return None
+        rows = await self.get_observations(company_id=company_id, signal_code=signal_code,
+                                           latest_only=True, limit=1)
+        return rows[0] if rows and rows[0].get("value_num") == 1 else None
+
+    async def accelerator(self, company_id: str) -> str | None:
+        """The accelerator(s) the company says it went through ("Techstars
+        2024; Antler", or "" for a search hit that didn't say which), or
+        None. YC is yc_batch's."""
+        row = await self._latest_yes(company_id, "ACCELERATOR")
+        return (row.get("value_text") or "") if row else None
+
+    async def funding_round(self, company_id: str) -> dict | None:
+        """The latest raise the company announced on its own site, as
+        {"round", "amount", "date"} (any may be ""), or None."""
+        row = await self._latest_yes(company_id, "FUNDING_ROUND")
+        return parse_funding(row.get("value_text") or "") if row else None
+
     async def get_observations(
         self,
         company_id: str = "",
@@ -1316,7 +1802,15 @@ class StateManager:
     # and signal, with history still on disk underneath). `positive` is the
     # subset where the finding is actually true — value_num IS NULL covers text
     # signals like INCUMBENT_AGENCY, where the row's existence IS the finding.
-    _CURRENT_CTE = """
+    # Rank signals are different: a company has one rank PER SEARCH PHRASE
+    # (value_text), so "is it ranked" and "rank 11-30" read the newest row of
+    # each phrase — #4 for one search and #18 for another is in range on the
+    # second. Ties within one second (two searches in a run) go to the row
+    # written last. A search that no longer finds the company writes 0 for
+    # that phrase, which reads as absent. Rows from before phrases were
+    # stored (empty value_text) stop counting once a phrased row exists.
+    _RANK_CODES = "('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK')"
+    _CURRENT_CTE = f"""
     WITH latest AS (
         SELECT o.* FROM observations o
         JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
@@ -1324,9 +1818,27 @@ class StateManager:
           ON newest.company_id = o.company_id
          AND newest.signal_code = o.signal_code
          AND newest.t = o.observed_at
+        WHERE o.signal_code NOT IN {_RANK_CODES}
+    ),
+    ranked AS (
+        SELECT o.* FROM observations o
+        WHERE o.signal_code IN {_RANK_CODES}
+          AND o.rowid = (
+              SELECT n.rowid FROM observations n
+              WHERE n.company_id = o.company_id
+                AND n.signal_code = o.signal_code
+                AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
+              ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1)
+          AND NOT (COALESCE(o.value_text, '') = '' AND EXISTS (
+              SELECT 1 FROM observations p
+              WHERE p.company_id = o.company_id
+                AND p.signal_code = o.signal_code
+                AND COALESCE(p.value_text, '') != ''))
     ),
     positive AS (
         SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
+        UNION ALL
+        SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
     )
     """
 
@@ -1384,6 +1896,71 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
 
+    async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
+        """Companies currently ranked (or in the pack) for this search phrase."""
+        async with self._connect() as db:
+            async with db.execute(
+                self._CURRENT_CTE + " SELECT DISTINCT company_id FROM positive "
+                "WHERE signal_code = ? AND value_text = ? AND company_id != ''",
+                (code, phrase),
+            ) as cursor:
+                return {row[0] for row in await cursor.fetchall()}
+
+    async def cohort_companies(self, require: list[str], exclude: list[str],
+                               offset: int = 0, limit: int | None = None,
+                               ranges: list[dict] | None = None) -> tuple[int, list[dict]]:
+        """Count all matches and page company details in one read snapshot.
+
+        ``ranges`` are numeric filters, ``[{"code", "min", "max"}]`` with
+        either bound optional: organic rank 11-30 is
+        ``{"code": "SERP_RANK", "min": 11, "max": 30}``. A range implies the
+        signal is present, so a range alone is a cohort.
+        """
+        ranges = list(ranges or [])
+        if not require and not ranges:
+            return 0, []
+        require = list(dict.fromkeys(require))
+        exclude = list(dict.fromkeys(exclude))
+        where, params = [], []
+        if require:
+            where.append(
+                "id IN (SELECT company_id FROM positive WHERE company_id != '' AND "
+                f"signal_code IN ({','.join('?' for _ in require)}) "
+                "AND confidence >= 0 GROUP BY company_id "
+                "HAVING COUNT(DISTINCT signal_code) = ?)")
+            params += [*require, len(require)]
+        if exclude:
+            where.append("id NOT IN (SELECT company_id FROM positive "
+                         f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
+            params.extend(exclude)
+        for r in ranges:
+            # The same current, positive, confidence >= 0 view require uses.
+            sub = ("id IN (SELECT company_id FROM positive WHERE signal_code = ? "
+                   "AND value_num IS NOT NULL AND confidence >= 0")
+            params.append(r["code"])
+            if r.get("min") is not None:
+                sub += " AND value_num >= ?"
+                params.append(float(r["min"]))
+            if r.get("max") is not None:
+                sub += " AND value_num <= ?"
+                params.append(float(r["max"]))
+            where.append(sub + ")")
+        base = (self._CURRENT_CTE +
+                " SELECT {columns} FROM companies WHERE " + " AND ".join(where))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN")
+            async with db.execute(base.format(columns="COUNT(*)"), params) as cursor:
+                size = (await cursor.fetchone())[0]
+            sql = base.format(columns="id, name, domain, website, industry, location")
+            sql += " ORDER BY LOWER(COALESCE(name, '')), id"
+            page_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                page_params.extend([limit, offset])
+            async with db.execute(sql, page_params) as cursor:
+                return size, [dict(row) for row in await cursor.fetchall()]
+
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
     ) -> list[dict]:
@@ -1436,6 +2013,20 @@ class StateManager:
                 """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 (company_id,),
+            )
+            await db.commit()
+
+    async def rename_company(self, company_id: str, name: str):
+        """Set a company's name, and the copy each of its prospects carries."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (name, company_id),
+            )
+            await db.execute(
+                "UPDATE prospects SET company = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE company_id = ?",
+                (name, company_id),
             )
             await db.commit()
 
@@ -1536,6 +2127,32 @@ class StateManager:
 
     # ── Settings (operational flags: kill switch, counters) ──
 
+    FOOTER_HISTORY_KEY = "compliance_footer_history"
+
+    async def remember_footer_lines(self, lines) -> None:
+        """Keep every footer line Harvey has sent under a cold email, so a
+        reply quoting an old one (since reworded) is still known as ours."""
+        lines = [l.strip() for l in lines if l and l.strip()]
+        if not lines:
+            return
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            known = []
+        if not isinstance(known, list):
+            known = []
+        merged = [l for l in known if isinstance(l, str)]
+        merged += [l for l in lines if l not in merged]
+        if merged != known:
+            await self.set_setting(self.FOOTER_HISTORY_KEY, json.dumps(merged[-50:]))
+
+    async def get_footer_history(self) -> list[str]:
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [l for l in known if isinstance(l, str)] if isinstance(known, list) else []
+
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:
             async with db.execute(
@@ -1543,6 +2160,22 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else default
+
+    async def retry_write_failed(self) -> int:
+        """Give every 'write_failed' prospect another try. Returns how many."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'new', updated_at = ? "
+                "WHERE status = 'write_failed'",
+                (_utcnow().isoformat(),),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def delete_setting(self, key: str):
+        async with self._connect() as db:
+            await db.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await db.commit()
 
     async def set_setting(self, key: str, value: str):
         async with self._connect() as db:
@@ -1594,6 +2227,33 @@ class StateManager:
                         return True
         return False
 
+    async def count_writable_prospects(self) -> int:
+        """New prospects the Writer can draft for (a deliverable email)."""
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects p
+                    WHERE status = 'new' AND email != ''
+                      AND email_status IN ({marks}) AND NOT {_company_answered('p')}""",
+                WRITABLE_EMAIL_STATUSES,
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def count_recent_unusable_prospects(self, hours: int = 24) -> int:
+        """New prospects found in the last ``hours`` that the Writer can't use."""
+        since = (_utcnow() - timedelta(hours=hours)).isoformat()
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects
+                    WHERE status = 'new'
+                      AND NOT (COALESCE(email, '') != ''
+                               AND COALESCE(email_status, '') IN ({marks}))
+                      AND datetime(created_at) >= datetime(?)""",
+                (*WRITABLE_EMAIL_STATUSES, since),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
     async def count_prospects_by_status(self) -> dict[str, int]:
         async with self._connect() as db:
             async with db.execute(
@@ -1639,6 +2299,46 @@ class StateManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
+
+    async def get_writing_feedback(
+        self, prospect_ids: list[str] | tuple = (), limit: int = 10
+    ) -> list[dict]:
+        """What the owner said about past campaigns (newest first), plus
+        anything said about these contacts: the Writer follows it.
+
+        Each row: {"about": "campaign 'Denver roofers'" | "Dana Ruiz",
+        "comment": ...}."""
+        out: list[dict] = []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT f.comment, f.created_at, c.name FROM feedback f
+                   LEFT JOIN campaigns c ON c.id = f.entity_id
+                   WHERE f.entity_type = 'campaign' AND TRIM(f.comment) != ''
+                   ORDER BY f.created_at DESC LIMIT ?""",
+                (int(limit),),
+            ) as cursor:
+                for r in await cursor.fetchall():
+                    about = f"campaign '{r['name']}'" if r["name"] else "a past campaign"
+                    out.append({"about": about, "comment": r["comment"],
+                                "created_at": r["created_at"]})
+            ids = [i for i in prospect_ids if i][:50]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                async with db.execute(
+                    f"""SELECT f.comment, f.created_at, p.first_name, p.last_name FROM feedback f
+                        JOIN prospects p ON p.id = f.entity_id
+                        WHERE f.entity_type = 'contact' AND f.entity_id IN ({marks})
+                          AND TRIM(f.comment) != ''
+                        ORDER BY f.created_at DESC LIMIT ?""",
+                    (*ids, int(limit)),
+                ) as cursor:
+                    for r in await cursor.fetchall():
+                        name = " ".join(x for x in (r["first_name"], r["last_name"]) if x)
+                        out.append({"about": name or "this contact", "comment": r["comment"],
+                                    "created_at": r["created_at"]})
+        out.sort(key=lambda n: str(n.get("created_at") or ""), reverse=True)  # newest first
+        return out
 
     # ── Reply Deduplication ──
 
@@ -2018,6 +2718,13 @@ class StateManager:
 
         return {
             "prospects": prospect_counts,
+            # The 'new' prospects the Writer can act on. A guessed or invalid
+            # address stays 'new' forever, so deciding from the raw count
+            # would keep choosing write_campaign with nothing to write.
+            "writable_prospects": await self.count_writable_prospects(),
+            # Unusable ones found in the last day: the heartbeat pauses
+            # prospecting for the day when these alone fill the backlog.
+            "recent_unusable_prospects": await self.count_recent_unusable_prospects(),
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
@@ -2028,3 +2735,4 @@ class StateManager:
             # Claude budget the rest of the loop is rationing.
             "unprofiled": await self.count_companies_needing_profile(),
         }
+

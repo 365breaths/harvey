@@ -41,7 +41,7 @@ class Analyst:
         report_path = data_dir / "analytics.json"
         try:
             tmp_path = report_path.with_suffix(".json.tmp")
-            with open(tmp_path, "w") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, indent=2)
             tmp_path.replace(report_path)
             logger.info(f"Analyst: Report written to {report_path}")

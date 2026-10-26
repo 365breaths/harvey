@@ -17,7 +17,7 @@ import aiosmtplib
 import pytest
 import pytest_asyncio
 
-from harvey.config import ComplianceConfig, FooterConfig
+from harvey.config import ComplianceConfig
 from harvey.integrations import smtp_mail
 from harvey.integrations.mail_provider import (
     ACCEPTED,
@@ -31,7 +31,7 @@ from harvey.integrations.mail_provider import (
     is_permanent_bounce,
 )
 from harvey.integrations.smtp_mail import SmtpImapProvider, classify_rejection
-from harvey.state import StateManager
+from harvey.state import MAYBE_SENT_PREFIX, StateManager
 from tests.test_outbox_native import (
     FakeProvider,
     make_handler,
@@ -56,7 +56,7 @@ async def state():
 def smtp_config():
     return SimpleNamespace(
         persona=SimpleNamespace(name="Dan", from_name="", email="dan@send.test"),
-        compliance=ComplianceConfig(footer=FooterConfig(postal_address="1 Test St")),
+        compliance=ComplianceConfig(postal_address="1 Test St"),
     )
 
 
@@ -469,7 +469,8 @@ async def test_uncertain_send_is_never_retried(state):
     provider = ScriptedProvider([SendResult(ok=False, outcome=UNCERTAIN, error="data: gone")])
     sender = make_sender(state, provider)
     await sender._drain_due()
-    assert (await state.get_outbox_item(item_id))["status"] == "uncertain"
+    row = await state.get_outbox_item(item_id)
+    assert row["status"] == "failed" and row["error"].startswith(MAYBE_SENT_PREFIX)
     await sender._drain_due()
     assert len(provider.sent) == 1
 
@@ -479,26 +480,33 @@ async def test_crash_mid_send_does_not_resend(state):
     pid = await seed_prospect(state)
     item_id = await _approved(state, pid)
     # Simulate a crash: claimed, server call made, outcome never written.
-    assert await state.claim_outbox_item(item_id, "<preset@x>")
-    old = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)).isoformat()
+    assert await state.claim_outbox_item(item_id)
+    await state.update_outbox_item(item_id, message_id="<preset@x>")
+    old = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)).isoformat()
     async with state._connect() as db:
         await db.execute("UPDATE outbox SET updated_at = ? WHERE id = ?", (old, item_id))
         await db.commit()
     provider = ScriptedProvider()
-    await make_sender(state, provider)._drain_due()
+    await make_sender(state, provider)._run_native()
     assert provider.sent == []
     row = await state.get_outbox_item(item_id)
-    assert row["status"] == "uncertain" and row["message_id"] == "<preset@x>"
+    assert row["status"] == "failed" and row["error"].startswith(MAYBE_SENT_PREFIX)
+    assert row["message_id"] == "<preset@x>"
     # A second claim on the same row is impossible.
     assert not await state.claim_outbox_item(item_id)
 
 
 @pytest.mark.asyncio
-async def test_daily_cap_counts_uncertain(state):
+async def test_daily_cap_counts_sends_that_may_have_gone_out(state):
     pid = await seed_prospect(state)
-    item_id = await _approved(state, pid)
-    await state.update_outbox_item(item_id, status="uncertain")
-    assert await state.count_outbox_sent_today() == 1
+    maybe = await _approved(state, pid)
+    await state.update_outbox_item(maybe, status="failed", error=MAYBE_SENT_PREFIX + "lost")
+    in_flight = await _approved(state, pid, step=2)
+    await state.update_outbox_item(in_flight, status="sending")
+    refused = await _approved(state, pid, step=3)
+    await state.update_outbox_item(refused, status="failed", error="rcpt: 550")
+    assert await state.count_outbox_sent_today() == 2
+    assert await state.count_outbox_sent_today(kind="sequence") == 2
 
 
 # ── Handler: header matching, opt-outs, bounces ──

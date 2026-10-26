@@ -56,7 +56,7 @@ def get_oauth_token() -> Optional[str]:
     creds_file = claude_config_dir() / ".credentials.json"
     try:
         if creds_file.is_file():
-            token = _token_from_json_blob(creds_file.read_text())
+            token = _token_from_json_blob(creds_file.read_text(encoding="utf-8"))
             if token:
                 return token
     except OSError as e:
@@ -67,7 +67,7 @@ def get_oauth_token() -> Optional[str]:
     if default_creds != creds_file:
         try:
             if default_creds.is_file():
-                token = _token_from_json_blob(default_creds.read_text())
+                token = _token_from_json_blob(default_creds.read_text(encoding="utf-8"))
                 if token:
                     return token
         except OSError:

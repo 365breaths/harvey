@@ -53,7 +53,7 @@ class LinkedInAutomation:
         today = date.today().isoformat()
         try:
             if ACTIVITY_PATH.exists():
-                data = json.loads(ACTIVITY_PATH.read_text())
+                data = json.loads(ACTIVITY_PATH.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and data.get("date") == today:
                     return {
                         "date": today,
@@ -67,7 +67,7 @@ class LinkedInAutomation:
     def _save_activity(self):
         try:
             ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            ACTIVITY_PATH.write_text(json.dumps(self._activity))
+            ACTIVITY_PATH.write_text(json.dumps(self._activity), encoding="utf-8")
         except OSError as e:
             logger.debug(f"Could not save LinkedIn activity log: {e}")
 
@@ -139,7 +139,7 @@ class LinkedInAutomation:
         # Load cookies if we have them (avoids re-login)
         if COOKIES_PATH.exists():
             try:
-                cookies = json.loads(COOKIES_PATH.read_text())
+                cookies = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
                 if isinstance(cookies, list):
                     await self.context.add_cookies(cookies)
                     logger.info("Loaded saved LinkedIn cookies.")
@@ -151,7 +151,7 @@ class LinkedInAutomation:
     def _save_cookies_sync(self, cookies: list):
         try:
             COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
-            COOKIES_PATH.write_text(json.dumps(cookies))
+            COOKIES_PATH.write_text(json.dumps(cookies), encoding="utf-8")
             try:
                 COOKIES_PATH.chmod(0o600)  # session cookies are credentials
             except OSError:

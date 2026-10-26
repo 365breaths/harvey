@@ -12,7 +12,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from pathlib import Path
 
 from harvey.state import StateManager
@@ -20,6 +19,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.brain")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "skills"
@@ -28,7 +28,7 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_TIMEOUT_SECONDS = 300  # a single Claude call should never hang forever
 DEFAULT_MAX_RETRIES = 2  # retries on transient failures (non-zero exit, timeout)
 RETRY_BASE_DELAY = 5.0  # seconds; doubles per attempt
-_MAX_ARGV_PROMPT_CHARS = 8000  # longer prompts go via stdin (Windows argv limit)
+KILL_REAP_SECONDS = 10.0  # waiting for a killed child on shutdown
 
 # stderr fragments that indicate retrying is pointless
 _NON_RETRYABLE_PATTERNS = (
@@ -88,6 +88,10 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
+        # Whether the last think_json got no reply at all (an outage, logout,
+        # rate limit or timeout), as opposed to a reply that wasn't valid
+        # JSON. Callers that count model failures must not count outages.
+        self.last_reply_empty = False
         # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
@@ -134,7 +138,7 @@ class Brain:
         runtimes every heartbeat.
         """
         if self.provider != "codex":
-            return ""
+            return await self._claude_preflight()
         from harvey.codex import CodexError
 
         await self._expire_usage_pause()
@@ -174,6 +178,27 @@ class Brain:
                 await self._mark_available()
         return ""
 
+    async def _claude_preflight(self) -> str:
+        """Claude: the installed CLI must support every isolation flag
+        (claude_runtime.check_cli). Runs ``claude --help`` only: no login
+        check, no model call. Returns "" or why calls are paused."""
+        from harvey.claude_runtime import ClaudeRuntimeError, check_cli
+
+        try:
+            await asyncio.to_thread(check_cli)
+        except ClaudeRuntimeError as e:
+            await self._mark_unavailable(e)
+            return self.unavailable
+        if self.unavailable:
+            await self._mark_available()
+        return ""
+
+    def _fingerprint(self):
+        if self.provider == "codex":
+            return self.codex.fingerprint()
+        from harvey.claude_runtime import fingerprint
+        return fingerprint()
+
     async def _start_usage_pause(self):
         self._usage_limited_until = time.monotonic() + USAGE_LIMIT_PAUSE_SECONDS
         until = time.time() + USAGE_LIMIT_PAUSE_SECONDS
@@ -197,10 +222,10 @@ class Brain:
         first = not self.unavailable or self.unavailable != str(error)
         self.unavailable = str(error)
         self._unavailable_at = time.monotonic()
-        self._unavailable_fingerprint = self.codex.fingerprint()
+        self._unavailable_fingerprint = self._fingerprint()
         if first:
             await self._record_status("paused", self.unavailable,
-                                      kind=getattr(error, "kind", ""))
+                                      kind=getattr(error, "kind", "setup"))
 
     async def _mark_available(self):
         logger.info(f"{self.provider_label} is available again; resuming.")
@@ -243,36 +268,22 @@ class Brain:
                 max_retries=max_retries, agent=agent, task=task,
             )
 
-        # Windows caps a command line at ~32k chars and surfaces the overflow
-        # as FileNotFoundError (WinError 206), so long prompts go via stdin.
-        prompt_via_stdin = len(prompt) > _MAX_ARGV_PROMPT_CHARS
-        cmd = ["claude", "-p"]
-        if not prompt_via_stdin:
-            cmd.append(prompt)
-        cmd += [
-            # JSON output carries exact token/cost accounting per call.
-            "--output-format", "json",
-            # No tools at all: Harvey only ever needs text back, and prompts
-            # carry untrusted text (prospect replies, scraped pages). With no
-            # tools, an injected instruction has nothing to act with.
-            # --tools "" removes the built-in tools; --strict-mcp-config stops
-            # the operator's own MCP servers and connectors from loading.
-            "--tools", "",
-            "--strict-mcp-config",
-        ]
-        if self.model:
-            # Validated by BrainConfig; affects this call only, never the
-            # operator's own Claude Code settings.
-            cmd += ["--model", self.model]
-        if session_id:
-            # The CLI only accepts UUIDs for --session-id; callers pass
-            # friendly names ("harvey-scout") purely as a debug label, and
-            # one-shot -p calls get no continuity from a session id anyway.
-            try:
-                uuid.UUID(session_id)
-                cmd.extend(["--session-id", session_id])
-            except ValueError:
-                pass
+        from harvey import claude_runtime
+
+        # Never start an unisolated call: a CLI missing any isolation flag
+        # pauses Claude (like a Codex setup problem) until it's updated.
+        try:
+            executable = await asyncio.to_thread(claude_runtime.check_cli)
+        except claude_runtime.ClaudeRuntimeError as e:
+            logger.error(f"Claude call not sent: {e}")
+            await self._mark_unavailable(e)
+            return ""
+        if self.unavailable:
+            await self._mark_available()
+
+        # The prompt always travels on stdin: argv is visible to other local
+        # users, Windows caps it at ~32k chars, and .cmd shims re-parse it.
+        cmd = claude_runtime.build_command(executable, self.model, session_id)
 
         logger.debug(f"Brain call (session={session_id}): {prompt[:100]}...")
 
@@ -288,29 +299,50 @@ class Brain:
 
             process = None
             try:
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    # DEVNULL: the CLI reads inherited stdin as prompt input,
-                    # stealing the terminal (and any piped answers) from Harvey.
-                    stdin=(asyncio.subprocess.PIPE if prompt_via_stdin
-                           else asyncio.subprocess.DEVNULL),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        process.communicate(
-                            prompt.encode("utf-8") if prompt_via_stdin else None
-                        ),
-                        timeout=timeout,
+                # The directory outlives the child: it's removed only after
+                # the process has exited (Windows can't delete a live cwd).
+                with claude_runtime.isolated_cwd() as cwd:
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        # A fresh empty directory: never the checkout (whose
+                        # CLAUDE.md is the setup wizard) or its ancestors.
+                        cwd=cwd,
+                        env=claude_runtime.runtime_env(cwd),
+                        # A pipe, never the inherited terminal.
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                except asyncio.TimeoutError:
-                    logger.error(f"Claude call timed out after {timeout:.0f}s. Killing process.")
                     try:
-                        process.kill()
-                        await process.wait()
-                    except ProcessLookupError:
-                        pass
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(prompt.encode("utf-8")),
+                            timeout=timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            f"Claude call timed out after {timeout:.0f}s. Killing process.")
+                        try:
+                            process.kill()
+                            await process.wait()
+                        except ProcessLookupError:
+                            pass
+                        stdout = None
+                    except BaseException:
+                        # Shutting down: stop and reap the child before its
+                        # directory is removed, then let the cancellation
+                        # through. The reap is bounded so a stuck child can't
+                        # hold shutdown; a second cancel ends it at once.
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await asyncio.wait_for(process.wait(),
+                                                   timeout=KILL_REAP_SECONDS)
+                        except Exception as e:
+                            logger.warning(f"Claude child not reaped on shutdown: {e!r}")
+                        raise
+                if stdout is None:
                     last_error = "timeout"
                     continue  # retry
 
@@ -342,17 +374,26 @@ class Brain:
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
 
+                if payload and payload.get("is_error"):
+                    # The CLI reported an API error (overloaded, rate limited)
+                    # inside a successful exit. That text is not the model's
+                    # answer, so no caller may use it as one: retry like any
+                    # other transient failure.
+                    logger.error(f"Claude reported an error: {response[:300]}")
+                    last_error = response
+                    continue
+
                 logger.debug(f"Brain response: {response[:200]}...")
                 return response
 
             except FileNotFoundError:
                 logger.error(
-                    "Claude CLI not found. Install it: https://claude.com/download"
+                    "Claude CLI not found. Install it: https://code.claude.com/docs/en/setup"
                 )
                 return ""  # not retryable
             except asyncio.CancelledError:
                 # Shutting down — kill the child so it doesn't orphan
-                if process is not None:
+                if process is not None and process.returncode is None:
                     try:
                         process.kill()
                     except ProcessLookupError:
@@ -546,6 +587,7 @@ class Brain:
         response = await self.think(
             full_prompt, session_id=session_id, agent=agent, task=task
         )
+        self.last_reply_empty = not response
         if not response:
             return None
         parsed = self._extract_json(response)
@@ -634,7 +676,7 @@ class Brain:
         """Load a prompt template from the prompts/ directory and fill in variables."""
         prompt_file = PROMPTS_DIR / f"{prompt_name}.md"
         try:
-            template = prompt_file.read_text()
+            template = read_user_text(prompt_file)
         except FileNotFoundError:
             logger.warning(f"Prompt file not found: {prompt_file}")
             return ""
@@ -655,7 +697,7 @@ class Brain:
         """Load a skill knowledge file from the skills/ directory."""
         skill_file = SKILLS_DIR / f"{skill_name}.md"
         try:
-            return skill_file.read_text()
+            return read_user_text(skill_file)
         except FileNotFoundError:
             logger.warning(f"Skill file not found: {skill_file}")
             return ""

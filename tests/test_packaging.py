@@ -96,9 +96,24 @@ CHECK = textwrap.dedent('''
 
     asyncio.run(main())
     assert os.listdir(tempfile.tempdir) == []
-    from harvey.dashboard import app  # noqa: F401
+    import harvey.dashboard as dash
+    from harvey import claude_runtime  # noqa: F401
     web = os.path.join(os.path.dirname(harvey.__file__), "web")
     assert os.path.exists(os.path.join(web, "app.js"))
+    assert os.path.exists(os.path.join(web, "auth.js"))
+    # The installed dashboard is locked: the token lives under WORK here.
+    from fastapi.testclient import TestClient
+    dash.token_store.configure(os.path.join(WORK, "data", "dashboard-token"))
+    dash.DB_PATH = __import__("pathlib").Path(WORK, "dash.db")
+    token = dash.token_store.get()
+    with TestClient(dash.app, base_url="http://127.0.0.1:5555") as c:
+        assert c.get("/").status_code == 200 and token not in c.get("/").text
+        assert c.get("/static/auth.js").status_code == 200
+        assert c.get("/api/companies").status_code == 401
+        assert c.get("/openapi.json").status_code == 401
+        ok = {"Authorization": "Bearer " + token}
+        assert c.get("/api/companies", headers=ok).status_code == 200
+        assert c.get("/openapi.json", headers=ok).status_code == 404
     print("WHEEL-OK")
 ''')
 

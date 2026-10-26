@@ -5,8 +5,10 @@ Falls back to manual scraping if no Cloudflare credentials are configured.
 """
 
 import asyncio
+import copy
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -18,11 +20,13 @@ from dotenv import load_dotenv
 
 from harvey.brain import Brain
 from harvey.config import BrainConfig, load_brain_config
+from harvey.public_http import UnsafeURLError, public_http_client
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 
 
 def _normalize_start_url(url: str) -> str:
@@ -201,8 +205,12 @@ class FallbackCrawler:
     on each crawled page until it hits the max_pages limit.
     """
 
+    # Set when a page was refused for pointing at a local or private address.
+    blocked = False
+
     async def crawl(self, base_url: str, max_pages: int = 100) -> dict[str, str]:
         """Recursively crawl a website by following internal links."""
+        self.blocked = False
         pages: dict[str, str] = {}
         visited: set[str] = set()
         domain = urlparse(base_url).netloc
@@ -210,9 +218,8 @@ class FallbackCrawler:
         # Queue starts with priority paths, then discovered links
         queue: list[str] = [urljoin(base_url, p) for p in FALLBACK_PATHS]
 
-        async with httpx.AsyncClient(
+        async with public_http_client(
             timeout=15,
-            follow_redirects=True,
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -273,6 +280,9 @@ class FallbackCrawler:
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             return raw_html, "\n".join(lines)
 
+        except UnsafeURLError:
+            self.blocked = True
+            return "", ""
         except Exception as e:
             logger.debug(f"Failed to fetch {url}: {e}")
             return "", ""
@@ -318,6 +328,110 @@ def brain_section(brain_config: BrainConfig) -> dict:
     if brain_config.reasoning_effort:
         section["reasoning_effort"] = brain_config.reasoning_effort
     return section
+
+
+# What training learns from a website. Retraining replaces exactly these and
+# keeps everything else in the existing config (email provider, quiet hours,
+# send limits, compliance, offer, the sender's name, email and tone, ...),
+# which are the operator's choices.
+LEARNED_FIELDS = {
+    "persona": ("company",),
+    "product": ("name", "description", "pricing", "key_benefits", "objection_responses"),
+    "icp": ("industries", "company_size", "titles", "geography"),
+}
+# The shipped template's placeholder company: a persona still carrying it
+# was never set up, so training fills in the whole persona.
+UNTRAINED_COMPANY = "Your Company"
+
+
+def _persona_untrained(persona) -> bool:
+    return (
+        not isinstance(persona, dict)
+        or persona.get("company") == UNTRAINED_COMPANY
+        or not persona.get("email")
+    )
+
+
+def merge_trained_config(learned: dict, existing: dict | None) -> dict:
+    """``existing`` with what training learned laid over it.
+
+    Sections the existing config lacks come from ``learned`` (its defaults).
+    The brain selection always comes from the trainer, which already starts
+    from the existing choice unless ``--provider`` overrode it.
+    """
+    if not isinstance(existing, dict) or not existing:
+        return learned
+    merged = copy.deepcopy(existing)
+    untrained = _persona_untrained(existing.get("persona"))
+    for section, value in learned.items():
+        if not isinstance(merged.get(section), dict):
+            merged[section] = copy.deepcopy(value)
+    for section, keys in LEARNED_FIELDS.items():
+        for key in keys:
+            if key in learned.get(section, {}):
+                merged[section][key] = copy.deepcopy(learned[section][key])
+    if untrained:
+        merged["persona"].update(copy.deepcopy(learned.get("persona", {})))
+    if "brain" in learned:
+        merged["brain"] = copy.deepcopy(learned["brain"])
+    # The trained site joins your own domains (autopilot may link to it);
+    # the ones already listed stay.
+    trained = ((learned.get("channels") or {}).get("email") or {}).get("link_domains") or []
+    if trained and isinstance(merged.get("channels"), dict):
+        email = merged["channels"].setdefault("email", {})
+        if isinstance(email, dict):
+            have = list(email.get("link_domains") or [])
+            email["link_domains"] = have + [d for d in trained if d not in have]
+    return merged
+
+
+def _backup(path: Path, raw: str) -> Path:
+    """Save ``raw`` next to ``path`` without overwriting an earlier backup."""
+    backup = path.with_name(path.name + ".bak")
+    if backup.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.{stamp}.bak")
+    backup.write_text(raw, encoding="utf-8")
+    return backup
+
+
+def write_trained_config(learned: dict, path: Path) -> dict:
+    """Write a trained config to ``path`` without losing the operator's settings.
+
+    The base is ``path`` itself when it exists. On a first training it is the
+    harvey.yaml next to it (the template Harvey ships, with the provider and
+    compliance blocks), never a config found elsewhere on disk. A base that
+    has content but can't be read as YAML is backed up before it is
+    replaced. The new file is swapped in whole, so a failed write never
+    leaves a half-written config. Returns what was written.
+    """
+    path = Path(path)
+    source = path if path.exists() else path.with_name("harvey.yaml")
+    existing = None
+    if source.exists():
+        raw = read_user_text(source)
+        try:
+            existing = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            existing = None
+        if not isinstance(existing, dict) and source == path and raw.strip():
+            backup = _backup(path, raw)
+            print(f"      Couldn't read the existing {path.name}; saved it as {backup.name}.")
+    config = merge_trained_config(learned, existing)
+    if config is not learned and source == path:
+        print(f"      Kept your settings from {path.name} (email provider, schedule, limits,")
+        print("      compliance, sender identity); updated the product, targeting and company.")
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+        if path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return config
 
 
 class Trainer:
@@ -377,7 +491,12 @@ class Trainer:
             self.scraped_pages = await crawler.crawl(base_url, max_pages=max_pages)
 
         if not self.scraped_pages:
-            print("\nERROR: Could not scrape any pages. Check the URL.")
+            if getattr(crawler, "blocked", False):
+                print(f"\nERROR: {base_url} points to a local or private address. Harvey only")
+                print("learns from public websites, so it never reaches into your own network.")
+                print("Train on the live public site instead.")
+            else:
+                print("\nERROR: Could not scrape any pages. Check the URL.")
             return None
 
         print(f"      Done! Crawled {len(self.scraped_pages)} pages.\n")
@@ -414,8 +533,8 @@ class Trainer:
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
-        with open(config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        guessed_email = config["persona"]["email"]
+        config = write_trained_config(config, config_path)
 
         # Generate product knowledge skill
         await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
@@ -437,8 +556,12 @@ class Trainer:
         print(f"    - skills/product_knowledge.md")
         if competitive_intel.get("competitors"):
             print(f"    - skills/competitive_intel.md")
-        print(f"\n  Review {config_path} and adjust as needed — especially the")
-        print(f"  persona name/email, which I guessed from your domain.")
+        if config["persona"].get("email") == guessed_email:
+            print(f"\n  Review {config_path} and adjust as needed — especially the")
+            print(f"  persona name/email, which I guessed from your domain.")
+        else:
+            print(f"\n  Review {config_path} and adjust as needed. Emails still go out as")
+            print(f"  {config['persona'].get('name', '')} <{config['persona']['email']}>.")
         print(f"  Then run: harvey run\n")
 
         return config
@@ -668,7 +791,7 @@ Do NOT pursue prospects who:
 """
 
         skills_path = PROJECT_ROOT / "skills" / "product_knowledge.md"
-        skills_path.write_text(knowledge)
+        skills_path.write_text(knowledge, encoding="utf-8")
         print(f"      Generated: skills/product_knowledge.md")
 
     async def _generate_battle_cards(self, product_info: dict, competitive_intel: dict):
@@ -716,7 +839,7 @@ What prospects do instead of buying a solution like ours:
 """
 
         skills_path = PROJECT_ROOT / "skills" / "competitive_intel.md"
-        skills_path.write_text(cards)
+        skills_path.write_text(cards, encoding="utf-8")
         print(f"      Generated: skills/competitive_intel.md")
 
     def _build_config(
@@ -760,9 +883,11 @@ What prospects do instead of buying a solution like ours:
                     "enabled": True,
                     "provider": "instantly",
                     "max_daily_sends": 50,
+                    # The trained site is yours: autopilot may link to it.
+                    "link_domains": [email_domain],
                 },
                 "linkedin": {
-                    "enabled": True,
+                    "enabled": False,
                     "max_daily_connections": 20,
                     "max_daily_messages": 10,
                 },
@@ -819,4 +944,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

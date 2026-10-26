@@ -3,6 +3,7 @@
 import asyncio
 import getpass
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -11,12 +12,13 @@ import yaml
 from pydantic import ValidationError
 
 from harvey.brain import Brain
-from harvey.config import BrainConfig
+from harvey.config import BrainConfig, normalize_prospect_country
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.setup")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -65,6 +67,48 @@ def _ask_yes_no(prompt: str, default: bool = True) -> bool:
     if not answer:
         return default
     return answer in ("y", "yes")
+
+
+def _read_env_file() -> dict[str, str]:
+    """The KEY=value pairs already in .env (comments and blank lines skipped)."""
+    existing: dict[str, str] = {}
+    if ENV_FILE.exists():
+        for line in read_user_text(ENV_FILE).splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                existing[key.strip()] = value.strip()
+    return existing
+
+
+def _config_file() -> Path:
+    """The config Harvey loads: harvey.local.yaml (what `harvey train` writes)
+    wins over harvey.yaml when it exists, as in config._find_config_file.
+    Setup reads and writes this file, so its answers are the ones Harvey uses."""
+    local = CONFIG_FILE.with_name("harvey.local.yaml")
+    return local if local.exists() else CONFIG_FILE
+
+
+def _current_precleared() -> dict:
+    """compliance.precleared in the file setup writes to, or {} if there is none."""
+    try:
+        data = yaml.safe_load(read_user_text(_config_file()))
+    except (OSError, yaml.YAMLError):
+        return {}
+    compliance = data.get("compliance") if isinstance(data, dict) else None
+    section = compliance.get("precleared") if isinstance(compliance, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _save_precleared(config: dict, answers: dict) -> None:
+    """Lay the setup answers over config's compliance.precleared, keeping the rest."""
+    compliance = config.get("compliance")
+    if not isinstance(compliance, dict):
+        compliance = config["compliance"] = {}
+    section = compliance.get("precleared")
+    if not isinstance(section, dict):
+        section = compliance["precleared"] = {}
+    section.update(answers)
 
 
 def _check_claude_cli() -> bool:
@@ -137,6 +181,10 @@ class SetupWizard:
         self.env_vars: dict[str, str] = {}
         self.config: dict = {}
         self.brain_config = BrainConfig()
+        # compliance.precleared answers to save; None leaves the config alone.
+        self.precleared: dict | None = None
+        # Whether _write_config saved the config, for the summary.
+        self.config_saved = False
 
     async def run(self):
         """Run the full interactive setup."""
@@ -152,7 +200,7 @@ class SetupWizard:
         _print_harvey("closing deals for you. I'll walk you through everything.")
         _print_harvey("This takes about 5 minutes.\n")
 
-        total_steps = 6
+        total_steps = 7
 
         # Step 1: Check prerequisites
         _print_step(1, total_steps, "Checking Prerequisites")
@@ -177,6 +225,10 @@ class SetupWizard:
         # Step 6: Configure behavior
         _print_step(6, total_steps, "Configure Behavior")
         self._setup_behavior()
+
+        # Step 7: Cold-email check (optional)
+        _print_step(7, total_steps, "Cold-Email Check (Optional)")
+        self._setup_compliance()
 
         # Write everything
         self._write_env()
@@ -383,7 +435,7 @@ class SetupWizard:
 
             from harvey.trainer import Trainer
             trainer = Trainer(brain_config=self.brain_config)
-            self.config = await trainer.train(url, str(CONFIG_FILE)) or {}
+            self.config = await trainer.train(url, str(_config_file())) or {}
 
             if self.config:
                 _print_harvey("Training complete! I've got a solid understanding")
@@ -592,15 +644,109 @@ class SetupWizard:
 
         _print_harvey("Perfect. All configured.")
 
+    def _setup_compliance(self):
+        """Offer the optional per-recipient check through Precleared.
+
+        Off unless the user says yes. Re-running setup offers the saved
+        answers as the defaults, so pressing Enter never switches it off.
+        """
+        current = _current_precleared()
+        was_on = current.get("enabled") is True
+        _print_harvey("Before the first email to anyone new, I can ask Precleared")
+        _print_harvey("(precleared.dev) which cold-email rules apply to them. A UK")
+        _print_harvey("sole trader needs consent where a limited company doesn't,")
+        _print_harvey("and the address alone won't tell you which. Totally optional.")
+        print("\n  Anything that isn't a clear yes waits in the Outbox with the reason.")
+        print("  It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly.")
+        print("  Precleared receives each new recipient's address, your country, how")
+        print("  the address was found, your product description and, if you set one,")
+        print("  your prospects' country.")
+
+        if not _ask_yes_no("Turn on the cold-email check?", default=was_on):
+            # Only touch the config to switch off a check that was on.
+            self.precleared = {"enabled": False} if was_on else None
+            _print_harvey("No problem. You can turn it on later under")
+            _print_harvey(f"compliance.precleared in {_config_file().name}.")
+            return
+
+        saved_country = str(current.get("sender_country") or "").strip().upper()
+        if saved_country not in ("GB", "US"):
+            saved_country = ""
+        while True:
+            country = _ask(
+                "Where is your business based? (GB or US"
+                + (")" if saved_country else "; blank to skip)"),
+                default=saved_country,
+                required=False,
+            ).upper()
+            country = {"UK": "GB", "USA": "US"}.get(country, country)
+            if country in ("GB", "US"):
+                break
+            if not country:
+                self.precleared = {"enabled": False} if was_on else None
+                _print_harvey("Precleared needs a sender based in the UK or US,")
+                _print_harvey("so I'll leave the check off for now.")
+                return
+            print("    (type GB or US, or leave it blank to skip)")
+
+        try:
+            saved_prospects = normalize_prospect_country(current.get("prospect_country"))
+        except ValueError:
+            saved_prospects = ""
+        hint = "type none if not" if saved_prospects else "blank if not"
+        while True:
+            answer = _ask(
+                f"Your prospects' country, if they're all in one (e.g. US; {hint})",
+                default=saved_prospects,
+                required=False,
+            )
+            if answer.strip().lower() == "none":
+                prospects = ""
+                break
+            # "no" answers "if they're all in one" but is also Norway's code.
+            if answer.strip().lower() == "no" and not _ask_yes_no(
+                    "NO is Norway's code. Are your prospects all in Norway?", default=False):
+                prospects = ""
+                break
+            try:
+                prospects = normalize_prospect_country(answer)
+                break
+            except ValueError as e:
+                print(f"    ({e})")
+
+        self.precleared = {
+            "enabled": True,
+            "sender_country": country,
+            "prospect_country": prospects,
+        }
+        self._ask_precleared_key()
+
+    def _ask_precleared_key(self):
+        """Offer a free Precleared key. Enter keeps the current one, or skips."""
+        saved_key = _read_env_file().get("PRECLEARED_API_KEY", "").strip("'\" ")
+        has_key = bool(saved_key or os.getenv("PRECLEARED_API_KEY", "").strip())
+        if not has_key:
+            _print_harvey("Without a key Precleared allows 10 checks a day. A free key")
+            _print_harvey("from https://precleared.dev/get-key allows 25.")
+        key = _ask(
+            "Precleared API key (input hidden; Enter keeps your current key)" if has_key
+            else "Precleared API key (input hidden; Enter to skip)",
+            required=False,
+            secret=True,
+        )
+        if key:
+            self.env_vars["PRECLEARED_API_KEY"] = key
+            _print_harvey("Saved the key to .env.")
+        elif has_key:
+            _print_harvey("Keeping the key you already have.")
+        else:
+            self.env_vars["PRECLEARED_API_KEY"] = ""
+            _print_harvey("No problem: 10 checks a day without one. Add")
+            _print_harvey("PRECLEARED_API_KEY to .env whenever you like.")
+
     def _write_env(self):
         """Write the .env file, preserving any existing variables we didn't touch."""
-        existing: dict[str, str] = {}
-        if ENV_FILE.exists():
-            for line in ENV_FILE.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    existing[key.strip()] = value.strip()
+        existing = _read_env_file()
 
         # Wizard answers win, but never blank out a previously-set value
         # (e.g. re-running setup and skipping the LinkedIn step).
@@ -610,7 +756,7 @@ class SetupWizard:
                 merged[key] = value
 
         lines = [f"{key}={value}" for key, value in merged.items()]
-        ENV_FILE.write_text("\n".join(lines) + "\n")
+        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
         try:
             ENV_FILE.chmod(0o600)  # credentials — owner read/write only
         except OSError:
@@ -621,19 +767,26 @@ class SetupWizard:
         """Write harvey.yaml (only if we have manual config — trainer writes its own)."""
         from harvey.trainer import brain_section
 
+        config_file = _config_file()
         if self.config:
             self.config["brain"] = brain_section(self.brain_config)
-        if self.config and not CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "w") as f:
+        if self.config and not config_file.exists():
+            if self.precleared:
+                _save_precleared(self.config, self.precleared)
+            with open(config_file, "w", encoding="utf-8") as f:
                 yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
-            logger.info(f"Wrote {CONFIG_FILE}")
+            logger.info(f"Wrote {config_file}")
+            self.config_saved = True
         elif self.config:
             # Config already exists (from trainer), update behavior settings only
             try:
-                with open(CONFIG_FILE) as f:
-                    existing = yaml.safe_load(f) or {}
+                existing = yaml.safe_load(read_user_text(config_file)) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
+                if "LINKEDIN_EMAIL" in self.env_vars:
+                    existing.setdefault("channels", {}).setdefault("linkedin", {})["enabled"] = bool(
+                        self.env_vars["LINKEDIN_EMAIL"]
+                    )
                 if "channels" in self.config:
                     existing.setdefault("channels", {})
                     if "email" in self.config["channels"]:
@@ -641,10 +794,15 @@ class SetupWizard:
                         existing["channels"]["email"]["max_daily_sends"] = (
                             self.config["channels"]["email"].get("max_daily_sends", 50)
                         )
-                with open(CONFIG_FILE, "w") as f:
-                    yaml.dump(existing, f, default_flow_style=False, sort_keys=False)
-            except Exception:
-                pass
+                if self.precleared:
+                    _save_precleared(existing, self.precleared)
+                text = yaml.dump(existing, default_flow_style=False, sort_keys=False)
+                with open(config_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                self.config_saved = True
+            except Exception as e:
+                _print_harvey(f"Couldn't save your settings to {config_file.name} ({e}).")
+                _print_harvey("Nothing in it was changed. Fix the file and re-run setup.")
 
     async def _print_summary(self):
         """Print final summary and next steps."""
@@ -664,7 +822,9 @@ class SetupWizard:
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),
-            "Product trained": CONFIG_FILE.exists(),
+            "Product trained": _config_file().exists(),
+            "Cold-email check (Precleared)": bool(
+                self.config_saved and self.precleared and self.precleared.get("enabled")),
         }
 
         for name, ok in checks.items():
@@ -674,7 +834,7 @@ class SetupWizard:
         print(f"""
   Files created:
     - .env (your credentials)
-    - harvey.yaml (your configuration)
+    - {_config_file().name} (your configuration)
 
   To start Harvey:
     harvey run          (or: python -m harvey)
@@ -707,4 +867,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

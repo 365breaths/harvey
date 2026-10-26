@@ -46,6 +46,7 @@ def test_env_config_defaults():
     env = EnvConfig()
     assert env.instantly_api_key == ""
     assert env.serper_api_key == ""
+    assert env.tinyfish_api_key == ""
 
 
 def test_offer_config_defaults():

@@ -11,15 +11,29 @@ design). Every draft still passes the deterministic pre-send gate.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
+from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import StateManager
+from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.sending_mode import sync_sending_mode
+from harvey.startups import startup_facts
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
+
+# How many times the model may fail to write a usable sequence for a
+# prospect before Harvey stops trying (status 'write_failed'). A provider
+# outage never counts; only a reply that came back unusable does.
+MAX_WRITE_ATTEMPTS = 3
+WRITE_ATTEMPTS_KEY = "write_attempts:"
+
+# Merge variables that name a person; a company inbox has none of them.
+PERSON_VAR = re.compile(r"\{\{\s*(first_?name|last_?name|title)\s*\}\}", re.IGNORECASE)
 
 # Native mode: one Claude call per prospect for email 1, so batches stay
 # small — the rest of the 'new' pool is picked up on later cycles.
@@ -60,10 +74,14 @@ class Writer:
         # Only write for prospects we can actually deliver to. Guessed and
         # invalid addresses are skipped so we don't spend Claude calls (or
         # sending reputation) on mail that will bounce.
-        deliverable = {"verified", "risky"}
         prospects_with_email = [
             p for p in new_prospects
-            if p.email and (p.email_status or "guess") in deliverable
+            if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
+        ]
+        # Someone at their company already replied: no cold email to write.
+        prospects_with_email = [
+            p for p in prospects_with_email
+            if not await self.state.colleague_who_replied(p.id)
         ]
         if not prospects_with_email:
             logger.info(
@@ -84,9 +102,19 @@ class Writer:
             )
 
             # Generate the email sequence
+            self._no_reply = False
             sequence = await self._write_sequence(prospects)
             if not sequence:
+                paused = getattr(self.brain, "paused_reason", "") or (
+                    "no reply from the model" if self._no_reply else "")
+                if paused:
+                    # The provider failed (outage, logout, rate limit,
+                    # timeout), not the draft: no attempt is counted, and the
+                    # other batches would fail the same way.
+                    logger.warning(f"Writer: {paused}; leaving '{batch_name}' for later.")
+                    return
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
+                await self._count_failed_attempt(batch_name, prospects)
                 continue
 
             # Create the campaign
@@ -102,7 +130,8 @@ class Writer:
 
             # Mark prospects so they aren't picked up again
             for p in prospects:
-                await self.state.update_prospect_status(p.id, "queued")
+                await self.state.queue_prospect_if_unsent(p.id)
+                await self.state.delete_setting(WRITE_ATTEMPTS_KEY + p.id)
 
             # Native providers: replace the shared template for email 1 with
             # a per-prospect draft grounded in that company's actual facts.
@@ -124,6 +153,38 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
+    async def _count_failed_attempt(self, batch_name: str, prospects: list):
+        """Count one unusable sequence against each prospect in the batch.
+
+        A prospect left 'new' makes the heartbeat choose write_campaign every
+        cycle, so after MAX_WRITE_ATTEMPTS it moves to 'write_failed': visible
+        in status and the dashboard, and out of the way of prospecting.
+        """
+        given_up = []
+        for p in prospects:
+            key = WRITE_ATTEMPTS_KEY + p.id
+            try:
+                attempts = int(await self.state.get_setting(key) or 0) + 1
+            except ValueError:
+                attempts = 1
+            if attempts >= MAX_WRITE_ATTEMPTS:
+                await self.state.update_prospect_status(p.id, "write_failed")
+                await self.state.delete_setting(key)
+                given_up.append(p.email)
+            else:
+                await self.state.set_setting(key, str(attempts))
+        if given_up:
+            await self.state.log_action(
+                action_type="write_failed",
+                agent="writer",
+                details={"campaign_name": batch_name, "prospects": given_up,
+                         "attempts": MAX_WRITE_ATTEMPTS},
+            )
+            logger.warning(
+                f"Writer: Gave up on {len(given_up)} prospect(s) in '{batch_name}' after "
+                f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
+            )
+
     async def _personalize_first_emails(self, campaign_id: str, prospects: list):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
@@ -132,6 +193,7 @@ class Writer:
         (campaign, prospect, step 1) slot. If a draft fails, the slot stays
         empty and the sender falls back to the campaign template.
         """
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -139,15 +201,24 @@ class Writer:
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
-        drafted = 0
+        pending = []
         for prospect in prospects:
             try:
                 draft = await self._write_personal_email(prospect)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
-            if not draft:
-                continue
+            if draft:
+                pending.append((prospect, draft))
+
+        # One Humanizer pass over the whole batch before anything is staged.
+        polished = await humanize(
+            self.brain, [d for _, d in pending], agent="writer",
+            enabled=humanizer_enabled(self.config),
+        )
+
+        drafted = 0
+        for (prospect, _), draft in zip(pending, polished):
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
@@ -158,6 +229,7 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
+                approved_by="" if require_approval else "autopilot",
             )
             if item_id:
                 drafted += 1
@@ -168,13 +240,54 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
+    async def _startup(self, company_id) -> list[str] | None:
+        """Fact lines when the company is a startup (YC, another accelerator,
+        a raise it announced; see harvey.startups), else None."""
+        return await startup_facts(getattr(self, "state", None), company_id)
+
+    def _startup_playbook(self) -> str:
+        """skills/selling_to_startups.md, for startup prospects ("" if absent)."""
+        text = self.brain.load_skill("selling_to_startups") if hasattr(self.brain, "load_skill") else ""
+        return "\n\nSELLING TO STARTUP FOUNDERS\n" + text if text else ""
+
+    async def _feedback_block(self, prospect_ids: list[str]) -> str:
+        """The owner's notes from the dashboard's Feedback buttons, as prompt
+        text ("" when there are none). Never lets a failed read stop writing."""
+        try:
+            notes = await self.state.get_writing_feedback(prospect_ids)
+        except Exception as e:
+            logger.warning(f"Writer: could not read feedback: {e}")
+            return ""
+        if not notes:
+            return ""
+        lines = "\n".join(
+            f"- {str(n.get('created_at') or '')[:10]} on {n['about']}: "
+            f"{' '.join(str(n['comment']).split())[:500]}" for n in notes)
+        return (
+            "\n\nOWNER FEEDBACK — notes the person running Harvey left on earlier\n"
+            "campaigns and contacts, newest first (a newer note wins). Apply them to\n"
+            "this writing. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
+            + lines
+        )
+
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
-        facts = [
-            f"- Name: {prospect.full_name()}",
-            f"- Title: {prospect.title}",
-            f"- Company: {prospect.company}",
-        ]
+        inbox_rule = ""
+        if prospect.is_company_inbox:
+            facts = [
+                f"- Name: unknown (the company's general inbox, {prospect.email})",
+                f"- Company: {prospect.company}",
+            ]
+            inbox_rule = (
+                "\n- This goes to the company's general inbox, most likely read by the owner"
+                "\n  or the office manager. Use no first name; open with 'Hi there' or"
+                "\n  address the company's team.")
+        else:
+            facts = [
+                f"- Name: {prospect.full_name()}",
+                f"- Title: {prospect.title}",
+                f"- Company: {prospect.company}",
+            ]
         if prospect.industry:
             facts.append(f"- Industry: {prospect.industry}")
 
@@ -195,6 +308,9 @@ class Writer:
                 )
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
+        startup = await self._startup(prospect.company_id)
+        if startup is not None:
+            facts.extend(startup)
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -209,23 +325,29 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        if startup is not None:
+            prompt += self._startup_playbook()
+        prompt += await self._feedback_block([prospect.id])
 
         prompt += f"""
 
 Write ONE cold email (the very first touch) to this specific person.
 
-FACTS — everything you know about them. Every claim about the prospect in
-your email must come from these facts. If a fact isn't listed here, you
-don't know it — do not invent funding rounds, mutual contacts, metrics,
-or anything else:
-{chr(10).join(facts)}
+FACTS — everything you know about them, gathered from their website and
+the web. Every claim about the prospect in your email must come from these
+facts. If a fact isn't listed here, you don't know it — do not invent
+funding rounds, mutual contacts, metrics, or anything else:
+{fence(chr(10).join(facts), "prospect research")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Under 75 words. One specific observation from the FACTS above, one
   question. No pitch, no product name.
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-5 words.
-- Follow every STRICT EMAIL RULE above.
+- No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
+- Follow every STRICT EMAIL RULE above.{inbox_rule}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
@@ -249,6 +371,19 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             + (f" | Notes: {p.personalization_notes}" if p.personalization_notes else "")
             for p in prospects[:5]  # Show sample for context
         )
+        inbox_batch = all(p.is_company_inbox for p in prospects)
+        if inbox_batch:
+            merge_rule = (
+                "- These go to each company's general inbox, so no names are known.\n"
+                "  Use {{company}} as the merge variable in every email and NEVER\n"
+                "  {{first_name}} or {{title}}. Greet with 'Hi there' or the company's team."
+            )
+        else:
+            merge_rule = (
+                "- Use {{first_name}}, {{company}}, {{title}} as merge variables — every email\n"
+                "  must use at least one, and email 1 must reference something specific to\n"
+                "  these prospects' industry or role (use the notes above)."
+            )
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -274,21 +409,30 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # One template goes to the whole batch: founder framing only when
+        # every prospect in it is a startup.
+        backed = [await self._startup(p.company_id) for p in prospects]
+        if prospects and all(b is not None for b in backed):
+            prompt += self._startup_playbook()
+        # Campaign notes only: this template goes to the whole batch, so a
+        # note about one person ("met her at the expo") must never reach it.
+        prompt += await self._feedback_block([])
 
         prompt += f"""
 
 Write a 3-email cold outreach sequence for prospects like these:
-{prospect_summary}
+{fence(prospect_summary, "sample prospects")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
 - Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
 - Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping.
-- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
-  must use at least one, and email 1 must reference something specific to
-  these prospects' industry or role (use the notes above).
+{merge_rule}
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words.
+- No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
 
 Return ONLY a JSON array (no markdown fences, no commentary):
@@ -302,7 +446,23 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="harvey-writer",
             agent="writer", task="write_sequence",
         )
-        return self._parse_sequence(result)
+        # Read right after the call, before anything else can use the brain.
+        self._no_reply = result is None and bool(getattr(self.brain, "last_reply_empty", False))
+        steps = self._parse_sequence(result)
+        if inbox_batch and any(
+            PERSON_VAR.search(s.subject + s.body) for s in steps
+        ):
+            # Nobody's name is known: "Hi {{first_name}}" or "as {{title}}"
+            # would render as "Hi there" at best and "as General inbox" at worst.
+            logger.warning("Writer: inbox sequence used a person merge variable; discarding it.")
+            return []
+        polished = await humanize(
+            self.brain, [{"subject": s.subject, "body": s.body} for s in steps],
+            agent="writer", enabled=humanizer_enabled(self.config),
+        )
+        for step, draft in zip(steps, polished):
+            step.subject, step.body = draft["subject"], draft["body"]
+        return steps
 
     def _parse_sequence(self, result) -> list[EmailStep]:
         """Robustly coerce LLM output into a validated EmailStep list.
@@ -361,7 +521,10 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         for prospect in prospects:
             # Group by industry + rough title category
             industry = prospect.industry or "general"
-            key = f"{industry}-outreach"
+            # Inbox prospects get their own campaign: their templates can't
+            # greet anyone by name.
+            kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
+            key = f"{industry}-{kind}"
 
             if key not in batches:
                 batches[key] = []

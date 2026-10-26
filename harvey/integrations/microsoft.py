@@ -77,7 +77,7 @@ class GraphError(RuntimeError):
 def _load_token() -> dict | None:
     try:
         if TOKEN_FILE.is_file():
-            data = json.loads(TOKEN_FILE.read_text())
+            data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict) and data.get("refresh_token"):
                 return data
     except (OSError, json.JSONDecodeError) as e:
@@ -87,7 +87,7 @@ def _load_token() -> dict | None:
 
 def _save_token(data: dict):
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(data, indent=2))
+    TOKEN_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     try:
         TOKEN_FILE.chmod(0o600)
     except OSError:
